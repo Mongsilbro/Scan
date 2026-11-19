@@ -527,6 +527,7 @@
         if (y > 0 && g[i - wout] > v) v = g[i - wout]; if (y < 47 && g[i + wout] > v) v = g[i + wout]; o[i] = v; }
       g = o; }
     for (let i = 0; i < n; i++) { const v = g[flip ? n - 1 - i : i] / 127.5 - 1; data[i] = data[n + i] = data[2 * n + i] = v; }
+    if (Q.get('dumpg') && !flip) (window.__g = window.__g || []).push({ w: wout, g: g.slice() });   // 시험용: 신경망에 넣은 글줄 그림 저장
     if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
     return { w: wout, data };
   }

@@ -28,7 +28,7 @@ cmaps = {os.path.basename(f)[:-6]: base64.b64encode(rd(f)).decode() for f in glo
 w = rd(N+'tesseract.js/dist/worker.min.js').decode()
 bug = 'return"string"==typeof t?t:t.data})).join("+")'
 assert w.count(bug) == 1
-w = w.replace(bug, 'return"string"==typeof t?t:t.code})).join("+")')  # tesseract.js 5.1.1: 내장 언어 데이터 사용 시 언어 이름 버그 수정
+w = w.replace(bug, 'return"string"==typeof t?t:t.code})).join("+")')  # tesseract.js 5.1.1~7.0.0: 내장 언어 데이터 사용 시 언어 이름 버그 수정
 assets = {
  'a-pdf': gz64(rd(N+'pdfjs-dist/build/pdf.min.js')),
  'a-pdfworker': gz64(rd(N+'pdfjs-dist/build/pdf.worker.min.js')),
@@ -40,12 +40,12 @@ assets = {
  'a-ort': gz64(rd(N+'onnxruntime-web/dist/ort.wasm.min.js')),
  'a-ortwasm': gz64(rd(N+'onnxruntime-web/dist/ort-wasm-simd.wasm')),
  'a-recworker': gz64(rd('src/recworker.js')),
- 'a-recmodel': gz64(rd('models/rec_small_int8.onnx')),
+ 'a-recmodel': gz64(rd(os.environ.get('REC_MODEL', 'models/rec_small_int8.onnx'))),
  'a-recdict': gz64(rd('models/dict_small.txt')),
 }
 blocks = '\n'.join(f'<script type="application/octet-stream" id="{k}">{v}</script>' for k, v in assets.items())
 main = open('src/main.js', encoding='utf-8').read()
 assert '</script' not in main
-s = head + '<!-- 내장 라이브러리: pdf.js 3.11.174 (Apache-2.0), tesseract.js 5.1.1 / tesseract.js-core (Apache-2.0), tessdata_fast kor (Apache-2.0), onnxruntime-web 1.16.3 (MIT), korean-handwriting-rec · PP-OCRv5 한국어 인식 모델 (Apache-2.0; 출력층을 상용 한글 2,350자·영문·기호로 줄이고 8비트로 경량화) -->\n' + blocks + '\n<script>\n' + main + '</script>\n</body>\n</html>\n'
+s = head + '<!-- 내장 라이브러리: pdf.js 3.11.174 (Apache-2.0), tesseract.js 7.0.0 / tesseract.js-core (Apache-2.0), tessdata_fast kor (Apache-2.0), onnxruntime-web 1.16.3 (MIT), korean-handwriting-rec · PP-OCRv5 한국어 인식 모델 (Apache-2.0; 출력층을 상용 한글 2,350자·영문·기호로 줄이고 8비트로 경량화) -->\n' + blocks + '\n<script>\n' + main + '</script>\n</body>\n</html>\n'
 open(out, 'w', encoding='utf-8').write(s)
 print(round(len(s)/1e6, 2), 'MB')

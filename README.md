@@ -22,6 +22,7 @@
 | `models/` | 내장 모델과 라이선스 (아래 표) |
 | `tools/build.py` | 라이브러리·모델을 모두 넣어 `dist/pdf-page-finder.html` 하나로 묶음. 같은 입력이면 같은 결과 |
 | `tools/prune_model.py` | 신경망 모델 경량화에 쓴 스크립트 |
+| `tools/fold_affine.py` | 모델의 배율·더하기 층을 합성곱에 합치는 스크립트(결과 같고 더 빠름). `models/rec_small_int8.onnx`에 적용됨 |
 | `tests/regress.js` | 회귀 테스트: 네트워크를 막은 브라우저에서 쪽 찾기·위치 표시·결과 저장 확인 |
 | `tests/bench.js` | 성능 측정: 시간, 키워드 적중률, 글자 정확도 |
 | `tests/gen_*.js`, `tests/fixtures/` | 시험용 스캔 PDF와 그 생성기 |
@@ -51,16 +52,16 @@ T=table2 node tests/bench.js dist/pdf-page-finder.html
 | 구성요소 | 버전·출처 | 라이선스 |
 |---|---|---|
 | pdf.js (`pdfjs-dist`) | 3.11.174 | Apache-2.0 |
-| tesseract.js, tesseract.js-core | 5.1.1 (빌드 때 내장 언어 데이터 이름 버그 한 줄 수정) | Apache-2.0 |
+| tesseract.js, tesseract.js-core | 7.0.0 (빌드 때 내장 언어 데이터 이름 버그 한 줄 수정) | Apache-2.0 |
 | 한국어 Tesseract 모델 `models/kor.traineddata` | tesseract-ocr/tessdata_fast (커밋 8741641) | Apache-2.0 |
 | onnxruntime-web | 1.16.3 | MIT |
-| 한국어 신경망 인식 모델 `models/rec_small_int8.onnx` | VerifiedIdiot/korean-handwriting-rec (커밋 7f974fc, PP-OCRv5 한국어 모델 추가 학습판)을 출력층 축소(상용 한글 2,350자·영문·숫자·기호)하고 8비트 경량화 | Apache-2.0 |
+| 한국어 신경망 인식 모델 `models/rec_small_int8.onnx` | VerifiedIdiot/korean-handwriting-rec (커밋 7f974fc, PP-OCRv5 한국어 모델 추가 학습판)을 출력층 축소(상용 한글 2,350자·영문·숫자·기호)하고 8비트 경량화, 배율·더하기 층을 합성곱에 합침 | Apache-2.0 |
 
 ## 측정 결과 (4코어, 2026-11-19)
 
 | 시험 문서 | 찾은 키워드 | 글자 정확도 | 걸린 시간 |
 |---|---|---|---|
-| 표 문서 6쪽 (`table2`) | 84/84 | 97.7% | 약 18초 (1차 결과 약 9~10초) |
-| 2단 문서 8쪽 (`hard2`) | 44~45/48 | 96.0% | 약 23~25초 (1차 결과 약 10~11초) |
+| 표 문서 6쪽 (`table2`) | 84/84 | 97.7% | 약 16~17초 (1차 결과 약 9초) |
+| 2단 문서 8쪽 (`hard2`) | 44~45/48 | 96.0% | 약 21~22초 (1차 결과 약 9~10초) |
 
 못 찾는 3~4개는 일부러 가장 흐리게 만든 쪽의 작은 각주에 있습니다.
