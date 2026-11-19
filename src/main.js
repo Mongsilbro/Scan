@@ -3,6 +3,8 @@
   const drop = $('drop'), fileInput = $('file'), bar = $('bar'), statusEl = $('status');
   const qEl = $('q'), hitsEl = $('hits'), chipsEl = $('chips'), summaryEl = $('summary');
   function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+  let early = null;                     // 준비가 끝나기 전에 고른 파일은 기억했다가 준비되면 분석
+  fileInput.onchange = () => { early = fileInput.files[0]; };
   const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   // ---------- 내장 자원 ----------
@@ -37,6 +39,10 @@
     table: Q.get('table') !== '0',        // 표 칸 단위 인식
     psmc: Q.get('psmc') || '6',           // 표 칸을 읽을 때의 방식
     rot: Q.get('rot') === '1',            // 기울기 자동 보정
+    chunk: +Q.get('chunk') || 8,          // 2차 판독에서 작업자에게 한 번에 넘기는 글줄 수
+    ahead: Q.has('ahead') ? +Q.get('ahead') : 1,   // 2차에서 신경망 작업자 수보다 몇 쪽 더 미리 준비할지
+    overlap: Q.get('overlap') !== '0',    // 1차 판독이 끝난 작업자부터 바로 2차 판독 시작
+    warm: Q.get('warm') !== '0',          // 페이지를 열 때 판독 엔진 미리 준비
     maxPx: 3800
   };
 
@@ -348,10 +354,13 @@
   }
   // 한 쪽을 그려서 읽음
   async function ocrPage(w, page, dpi, psm, knownDeg) {
+    const P0 = performance.now();
     const canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
+    const P1 = performance.now();
     if (CFG.prep) enhance(canvas);
-    let res = null;
+    let res = null; const P2 = performance.now();
     const seg = CFG.table ? segment(canvas, dpi) : null;
+    if (Q.get('debug')) console.log(`1차 render ${(P1 - P0) | 0}ms enhance ${(P2 - P1) | 0}ms segment ${(performance.now() - P2) | 0}ms`);
     if (seg && seg.cells.length && !knownDeg) res = await ocrTable(w, seg, psm);
     if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, canvas, knownDeg); res.canvas = canvas; }
     else canvas.width = canvas.height = 0;
@@ -360,21 +369,50 @@
 
   // ---------- 신경망 인식 (PP-OCRv5 한국어) ----------
   const NN = { ok: !!$('a-ort') && CFG.engine !== 'tess', pool: [], res: null };
-  function nnWorker() {
-    return (async () => {
-      if (!NN.res) NN.res = (async () => ({
+  const nnRes = () => NN.res || (NN.res = (async () => { const T = performance.now(); const R = {
         url: URL.createObjectURL(new Blob([await asset('a-ort', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
         wasm: await asset('a-ortwasm', true), model: await asset('a-recmodel', true),
         dict: new TextDecoder().decode(await asset('a-recdict', true))
-      }))();
-      const R = await NN.res;
+      }; if (Q.get('debug')) console.log('NN 자원 ' + ((performance.now() - T) | 0) + 'ms'); return R; })());
+  function nnWorker() {
+    return (async () => {
+      const R = await nnRes();
       const w = new Worker(R.url); let seq = 0; const pend = new Map();
       w.onmessage = e => { const p = pend.get(e.data.id); if (!p) return; pend.delete(e.data.id); e.data.type === 'error' ? p.no(new Error(e.data.message)) : p.ok(e.data); };
       w.onerror = e => { for (const p of pend.values()) p.no(new Error(e.message || '인식 작업자 오류')); pend.clear(); };
       const call = (m, tr) => new Promise((ok, no) => { m.id = ++seq; pend.set(m.id, { ok, no }); w.postMessage(m, tr || []); });
-      await call({ type: 'init', wasm: R.wasm, model: R.model, dict: R.dict });
+      const Ti = performance.now(); await call({ type: 'init', wasm: R.wasm, model: R.model, dict: R.dict });
+      if (Q.get('debug')) console.log('NN init ' + ((performance.now() - Ti) | 0) + 'ms');
       return { rec: lines => call({ type: 'rec', lines }, lines.map(l => l.data.buffer)), terminate: () => w.terminate() };
     })();
+  }
+
+  // 신경망 작업자 묶음: 한 쪽의 글줄을 몇 줄씩 나눠 쉬는 작업자가 바로 가져가 읽음 → 마지막 쪽도 모든 코어가 함께 읽음
+  function nnPool(live) {
+    const idle = [], q = [], all = []; let size = 0, closed = false, failed = null;
+    const pump = () => {
+      while (idle.length && q.length) {
+        const w = idle.pop(), j = q.shift();
+        if (!live()) { j.no(new Error('중지됨')); idle.push(w); continue; }
+        w.rec(j.lines).then(j.ok, j.no).finally(() => { if (!closed) { idle.push(w); pump(); } });
+      }
+    };
+    return {
+      get size() { return size; },
+      add(wp) {
+        size++;
+        wp.then(w => { if (closed) return w.terminate(); all.push(w); idle.push(w); pump(); },
+          e => { size--; if (!size && !all.length) { failed = e; q.splice(0).forEach(j => j.no(e)); } });
+      },
+      async rec(lines) {
+        if (failed) throw failed;
+        const parts = [];
+        for (let i = 0; i < lines.length; i += CFG.chunk) parts.push(lines.slice(i, i + CFG.chunk));
+        const rs = await Promise.all(parts.map(l => new Promise((ok, no) => { q.push({ lines: l, ok, no }); pump(); })));
+        return { texts: rs.flatMap(r => r.texts), confs: rs.flatMap(r => r.confs) };
+      },
+      close() { closed = true; q.splice(0).forEach(j => j.no(new Error('중지됨'))); all.forEach(w => w.terminate()); }
+    };
   }
 
   // 글줄 찾기: 글자를 가로로 번지게 해서 이어진 덩어리를 한 줄로 봄 (표 선은 넘지 않음). 줄마다 기울기도 구함
@@ -594,7 +632,7 @@
   // ---------- 분석 ----------
   const fmtLeft = sec => sec < 60 ? `약 ${Math.max(5, Math.round(sec / 5) * 5)}초 남음` : `약 ${Math.round(sec / 60)}분 남음`;
   async function analyze(file) {
-    const my = ++runId;
+    const my = ++runId; if (NN.cancel) NN.cancel();
     curFile = file; pages = []; total = 0; pdf = null; running = true;
     $('dropTitle').textContent = file.name;
     $('dropSub').textContent = '다른 파일을 분석하려면 다시 누르거나 끌어다 놓으세요';
@@ -625,9 +663,27 @@
       // 1단계: 글자 정보가 있으면 그대로, 없으면 빠른 엔진(Tesseract)으로 전체를 훑음 → 바로 검색 가능
       // 2단계: 신경망 엔진(PP-OCRv5)으로 스캔 쪽을 다시 읽어 결과를 보강
       const ocrPages = [], confOf = {};
+      const nWork = Math.min(CFG.workers, total);
+      const nnOn = fine && NN.ok;
+      const pool2 = nnOn ? nnPool(() => my === runId) : null;
+      const ready2 = [];                 // 1차가 끝나 2차를 기다리는 쪽
+      let left1 = nWork, inflight = 0, t1 = 0, k2 = 0, done2 = 0, t2 = 0, wake = null;
+      const poke = () => { if (wake) { const f = wake; wake = null; f(); } };
+      const slotNN = [];
+      NN.cancel = poke;                  // 중지하면 기다리던 2차 작업도 바로 끝냄
+      const toNN = slot => {            // 이 작업자 자리를 Tesseract → 신경망으로 바꿈
+        if (!pool2 || slotNN[slot]) return; slotNN[slot] = true;
+        if (pool[slot]) { pool[slot].then(w => w.terminate()).catch(() => {}); pool[slot] = null; }
+        pool2.add(nnWorker()); poke();
+      };
+      const status2 = () => {
+        let left = '';
+        if (done2 >= 2) left = ' · ' + fmtLeft((performance.now() - t2) / 1000 / done2 * (ocrPages.length - done2));
+        setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
+      };
       const loop1 = async slot => {
         while (my === runId) {
-          const n = next++; if (n > total) return;
+          const n = next++; if (n > total) break;
           const page = await doc.getPage(n);
           let text = '', text2 = '', src = 'text', tboxes = [];
           if (!force) {
@@ -644,6 +700,7 @@
           }
           if (text.replace(/\s/g, '').length < 20) {
             src = 'ocr';
+            if (!ocrCount && CFG.overlap) for (let i = nWork; i < CFG.workers; i++) toNN(i);   // 쪽 수보다 코어가 많으면 남는 코어에서 신경망 엔진을 미리 준비
             if (!ocrStart) { ocrStart = performance.now(); if (!ocrCount) setStatus('글자 인식 엔진 준비 중…'); }
             if (!pool[slot]) pool[slot] = makeWorker(lang);
             const w = await pool[slot];
@@ -660,56 +717,61 @@
           const layers = [Object.assign({ text, boxes: src === 'text' ? tboxes : null }, normalize(text))];
           if (text2) layers.push(Object.assign({ text: text2 }, normalize(text2)));
           pages[n - 1] = { n, src, layers };
-          done++; bar.value = done;
+          if (src === 'ocr' && pool2 && confOf[n] < CFG.skip2) { ready2.push(n); poke(); }
+          done++; if (!t1) bar.value = done;
           let left = '';
           if (ocrCount >= 2) left = ' · 1차 ' + fmtLeft((performance.now() - ocrStart) / 1000 / ocrCount * (total - done));
-          setStatus(`1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
+          if (!t1) setStatus(`1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
+          searchSoon();
+        }
+        if (my !== runId) return;
+        if (CFG.overlap && ocrCount) toNN(slot);
+        if (--left1 === 0) {            // 1차 판독 끝
+          t1 = Math.max(1, Math.round((performance.now() - t0) / 1000));
+          search();
+          if (pool2 && ocrPages.length) {
+            for (let i = 0; i < CFG.workers; i++) toNN(i);     // 쪽 수가 적어도 글줄을 나눠 모든 코어로 읽음
+            for (const p of pool) if (p) p.then(w => w.terminate()).catch(() => {});
+            pool = []; poolLang = '';
+            if (CFG.skip2 < 100) ocrPages.splice(0, ocrPages.length, ...ocrPages.filter(n => confOf[n] < CFG.skip2));
+            bar.max = ocrPages.length; bar.value = done2;
+            if (done2) status2(); else setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 준비 중…`);
+          }
+          poke();
+        }
+      };
+      // 2차: 1차가 끝난 쪽을 신경망 엔진으로 다시 읽음 (신경망 작업자가 하나라도 생기면 시작)
+      const loop2 = async () => {
+        while (my === runId && NN.ok) {
+          if (!(ready2.length > k2 && pool2.size && inflight < pool2.size + CFG.ahead)) {
+            if (left1 === 0 && ready2.length <= k2) return;
+            await new Promise(f => { const prev = wake; wake = () => { if (prev) prev(); f(); }; });
+            continue;
+          }
+          const n = ready2[k2++]; inflight++;
+          if (!t2) t2 = performance.now();
+          let r = null;
+          try {
+            const page = await doc.getPage(n);
+            r = await nnPage(pool2, page, CFG.dpi);
+            page.cleanup();
+          } catch (e) { if (my !== runId) return; console.error(e); if (!nnDone) { NN.ok = false; engineNote = ' · 신경망 엔진을 쓸 수 없어 1차 판독 결과만 사용'; } }
+          inflight--; poke();
+          if (my !== runId) return;
+          if (r) { nnDone++; const p = pages[n - 1]; p.layers.unshift(Object.assign({ text: r.text, boxes: r.boxes }, normalize(r.text))); }
+          done2++;
+          if (t1) { bar.value = done2; status2(); }
           searchSoon();
         }
       };
-      const nWork = Math.min(CFG.workers, total);
-      await Promise.all(Array.from({ length: nWork }, (_, i) => loop1(i)));
-      if (my !== runId) return;
-      const t1 = Math.round((performance.now() - t0) / 1000);
-      search();
-      if (fine && NN.ok && ocrPages.length) {
-        // 1단계 작업자를 정리해 메모리를 비우고 2단계 시작
-        for (const p of pool) p.then(w => w.terminate()).catch(() => {}); pool = []; poolLang = '';
-        // 1차 판독 신뢰도가 아주 높은 쪽은 2차 판독을 건너뜀 (skip2 기준)
-        if (CFG.skip2 < 100) { const keep = ocrPages.filter(n => confOf[n] < CFG.skip2); ocrPages.length = 0; ocrPages.push(...keep); }
-        ocrPages.sort((a, b) => a - b);
-        setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 준비 중…`);
-        let k = 0, done2 = 0; const t2 = performance.now();
-        bar.value = 0; bar.max = ocrPages.length;
-        const loop2 = async slot => {
-          while (my === runId && NN.ok) {
-            const n = ocrPages[k++]; if (n === undefined) return;
-            let r = null;
-            try {
-              if (!NN.pool[slot]) NN.pool[slot] = nnWorker();
-              const nw = await NN.pool[slot];
-              if (my !== runId) return;
-              const page = await doc.getPage(n);
-              r = await nnPage(nw, page, CFG.dpi);
-              page.cleanup();
-            } catch (e) { console.error(e); if (!nnDone) { NN.ok = false; engineNote = ' · 신경망 엔진을 쓸 수 없어 1차 판독 결과만 사용'; } }
-            if (my !== runId) return;
-            if (r) { nnDone++; const p = pages[n - 1]; p.layers.unshift(Object.assign({ text: r.text, boxes: r.boxes }, normalize(r.text))); }
-            done2++; bar.value = done2;
-            let left = '';
-            if (done2 >= 2) left = ' · ' + fmtLeft((performance.now() - t2) / 1000 / done2 * (ocrPages.length - done2));
-            setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
-            searchSoon();
-          }
-        };
-        await Promise.all(Array.from({ length: Math.min(nWork, ocrPages.length) }, (_, i) => loop2(i)));
-        for (const p of NN.pool) p.then(w => w.terminate()).catch(() => {}); NN.pool = [];
-      }
+      await Promise.all([...Array.from({ length: nWork }, (_, i) => loop1(i)), ...(pool2 ? Array.from({ length: nWork }, loop2) : [])]);
+      if (pool2) pool2.close();
       if (my !== runId) return;
       running = false;
       $('stop').classList.add('hidden');
       const sec = Math.round((performance.now() - t0) / 1000);
       if (key && !engineNote) cachePut({ key, at: Date.now(), name: file.name, total, pages: pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => ({ t: L.text, b: L.boxes })) })) });
+      setTimeout(prewarm, 1500);        // 다음 파일을 위해 1차 엔진을 미리 준비
       setStatus(`분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}`, 'ok');
       search();
     } catch (e) {
@@ -760,6 +822,7 @@
 
   function search() {
     lastSearch = performance.now();
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }   // 지금 찾으므로 미뤄 둔 검색은 취소
     const raw = qEl.value.trim();
     const q = normalize(raw).out;
     hitsEl.innerHTML = ''; chipsEl.innerHTML = '';
@@ -879,6 +942,14 @@
     analyze(file);
   }
 
+  // 파일을 고르기 전에 엔진을 미리 준비해 두어 분석 시작이 빨라지게 함
+  function prewarm() {
+    if (running || pool.some(Boolean) || !CFG.warm) return;
+    poolLang = 'kor';
+    pool = Array.from({ length: CFG.workers }, (_, i) => { const p = makeWorker('kor'); p.catch(() => { if (pool[i] === p) pool[i] = null; }); return p; });
+    if (NN.ok) nnRes().catch(() => {});
+  }
+
   drop.onclick = () => fileInput.click();
   drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } };
   fileInput.onchange = () => { pick(fileInput.files[0]); fileInput.value = ''; };
@@ -886,7 +957,7 @@
   ['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
   document.addEventListener('drop', e => pick(e.dataTransfer.files[0]));
   $('stop').onclick = () => {
-    runId++; running = false; $('stop').classList.add('hidden');
+    runId++; if (NN.cancel) NN.cancel(); running = false; $('stop').classList.add('hidden');
     setStatus(`중지됨: ${pages.filter(Boolean).length}/${total}쪽까지 분석했습니다.`); search();
   };
   $('force').onchange = $('fine').onchange = () => { if (curFile) analyze(curFile); };
@@ -897,4 +968,6 @@
   qEl.oninput = () => { clearTimeout(typing); typing = setTimeout(search, 150); };
   qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); } };
   $('pvClose').onclick = () => $('dlg').close();
+  if (early) { pick(early); early = null; }
+  setTimeout(prewarm, 0);              // 화면 동작을 다 연결한 뒤에 준비 시작
 })();

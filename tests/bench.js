@@ -1,4 +1,4 @@
-// 사용: T=table2 node tests/bench.js dist/pdf-page-finder.html [selector=value ...]
+// 사용: [WAIT=5000] T=table2 node tests/bench.js dist/pdf-page-finder.html [selector=value ...]
 // 네트워크 차단 상태에서 tests/fixtures/<T>.pdf 를 분석해 걸린 시간, 키워드 적중률, 글자 정확도를 잼 (T: table2 | hard2)
 const { chromium } = require('playwright'); const fs = require('fs'), path = require('path');
 const FX = path.join(__dirname, 'fixtures');
@@ -10,6 +10,7 @@ const FX = path.join(__dirname, 'fixtures');
   t.on('pageerror', e => console.log('pageerror:', e.message.slice(0, 300)));
   await t.goto('file://' + path.resolve(process.argv[2]) + '?nocache=1');
   for (const a of process.argv.slice(3)) { const [sel, val] = a.split('='); if (val === 'off') await t.uncheck(sel); else if (val === 'on') await t.check(sel); else await t.selectOption(sel, val); }
+  if (process.env.WAIT) await t.waitForTimeout(+process.env.WAIT);   // 사용자가 파일을 고르는 시간 흉내 (엔진 미리 준비 효과 측정)
   const t0 = Date.now();
   await t.setInputFiles('#file', path.join(FX, (process.env.T || 'table2') + '.pdf'));
   await t.waitForFunction(() => /분석 완료|오류/.test(document.getElementById('status').textContent), null, { timeout: 600000 });
