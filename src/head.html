@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>스캔 PDF 페이지 찾기</title>
+<style>
+  :root {
+    --bg: #f6f5f1; --card: #ffffff; --ink: #1d1d1b; --muted: #6b6a65;
+    --line: #dddbd3; --accent: #1f5fbf; --accent-ink: #ffffff; --mark: #ffe27a; --mark-ink: #1d1d1b;
+    --ok: #1c7c4a; --err: #b3261e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a; --card: #212326; --ink: #ececea; --muted: #a09f9a;
+      --line: #383a3e; --accent: #7fb0ff; --accent-ink: #10203a; --mark: #c9a227; --mark-ink: #17181a;
+      --ok: #6fd39d; --err: #ff8a80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.6 -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  }
+  main { max-width: 820px; margin: 0 auto; padding: 32px 16px 80px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+  .step { font-size: .8rem; font-weight: 700; color: var(--muted); letter-spacing: .04em; margin-bottom: 10px; }
+  #drop {
+    border: 2px dashed var(--line); border-radius: 10px; padding: 26px 16px; text-align: center;
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  #drop.over, #drop:hover { border-color: var(--accent); }
+  #drop strong { display: block; }
+  #drop span { color: var(--muted); font-size: .9rem; }
+  .row { display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; margin-top: 12px; font-size: .9rem; }
+  select, input[type=text], button {
+    font: inherit; color: var(--ink); background: var(--card);
+    border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px;
+  }
+  button { cursor: pointer; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .5; cursor: default; }
+  #q { flex: 1; min-width: 0; font-size: 1.05rem; padding: 10px 14px; }
+  .searchrow { display: flex; gap: 8px; }
+  progress { width: 100%; height: 10px; margin-top: 14px; accent-color: var(--accent); }
+  #status { font-size: .9rem; color: var(--muted); margin-top: 6px; min-height: 1.4em; }
+  #status.err { color: var(--err); }
+  #status.ok { color: var(--ok); }
+  #summary { font-weight: 600; margin: 14px 0 6px; }
+  #chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .chip {
+    border: 1px solid var(--accent); color: var(--accent); background: transparent;
+    border-radius: 999px; padding: 2px 12px; font-size: .9rem; font-weight: 600;
+  }
+  .hit { border-top: 1px solid var(--line); padding: 12px 0; }
+  .hit-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+  .hit-head button { font-weight: 700; padding: 3px 12px; }
+  .hit-head small { color: var(--muted); }
+  .snip { margin: 6px 0 0; font-size: .93rem; color: var(--muted); overflow-wrap: anywhere; }
+  mark { background: var(--mark); color: var(--mark-ink); border-radius: 3px; padding: 0 2px; }
+  dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); padding: 14px; max-width: min(96vw, 900px); }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  .dlg-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; gap: 10px; }
+  #pv { max-width: 100%; height: auto; display: block; border: 1px solid var(--line); }
+  details { margin-top: 10px; font-size: .9rem; }
+  #pvText { white-space: pre-wrap; max-height: 200px; overflow: auto; color: var(--muted); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>스캔 PDF 페이지 찾기</h1>
+  <p class="sub">스캔한 PDF의 글자를 인식(OCR)해서, 찾는 내용이 몇 페이지에 있는지 알려줍니다. 인터넷 연결 없이 이 파일 하나로 동작하며, PDF는 이 컴퓨터 안에서만 처리됩니다.</p>
+
+  <div class="card">
+    <div class="step">1. PDF 파일 선택</div>
+    <div id="drop" tabindex="0" role="button">
+      <strong id="dropTitle">여기를 눌러 PDF를 선택하거나, 파일을 끌어다 놓으세요</strong>
+      <span id="dropSub">스캔본 · 일반 PDF 모두 가능</span>
+    </div>
+    <input type="file" id="file" accept="application/pdf,.pdf" class="hidden">
+    <div class="row">
+      <label>문서 언어
+        <select id="lang">
+          <option value="kor+eng" selected>한국어 + 영어</option>
+          <option value="kor">한국어</option>
+          <option value="eng">영어</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="force"> 글자 정보가 있어도 항상 OCR 사용</label>
+      <button id="stop" class="hidden">중지</button>
+    </div>
+    <progress id="bar" value="0" max="1" class="hidden"></progress>
+    <div id="status"></div>
+  </div>
+
+  <div class="card">
+    <div class="step">2. 찾을 내용 입력</div>
+    <div class="searchrow">
+      <input type="text" id="q" placeholder="예: 계약 기간, 손해배상 …" autocomplete="off">
+      <button class="primary" id="go">찾기</button>
+    </div>
+    <div class="row" style="color:var(--muted)">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>
+    <div id="summary"></div>
+    <div id="chips"></div>
+    <div id="hits"></div>
+  </div>
+</main>
+
+<dialog id="dlg">
+  <div class="dlg-head">
+    <strong id="pvTitle"></strong>
+    <button id="pvClose">닫기</button>
+  </div>
+  <canvas id="pv"></canvas>
+  <details><summary>이 페이지에서 인식된 글자 보기</summary><div id="pvText"></div></details>
+</dialog>
+

@@ -1,0 +1,20 @@
+{
+  "name": "scan-pdf-page-finder",
+  "private": true,
+  "description": "스캔 PDF에서 찾는 내용이 몇 쪽에 있는지 알려주는 오프라인 단일 HTML 도구",
+  "scripts": {
+    "build": "python3 tools/build.py",
+    "test": "node tests/regress.js dist/pdf-page-finder.html",
+    "bench": "node tests/bench.js dist/pdf-page-finder.html"
+  },
+  "dependencies": {
+    "onnxruntime-web": "1.16.3",
+    "pdfjs-dist": "3.11.174",
+    "tesseract.js": "5.1.1",
+    "tesseract.js-core": "5.1.1"
+  },
+  "devDependencies": {
+    "@fontsource/nanum-myeongjo": "5.3.0",
+    "@fontsource/noto-sans-kr": "5.3.1"
+  }
+}
