@@ -9,6 +9,7 @@
 3. 쪽 번호를 누르면 미리보기에 찾은 위치가 노란 상자로 표시됩니다.
 
 - **2단계 판독**: 1차 판독(빠른 엔진)이 끝나면 바로 검색할 수 있고, 2차 판독(신경망 엔진)이 이어서 결과를 보강합니다. "정밀 판독"을 끄면 1차만 해서 약 2배 빠릅니다.
+- **그래픽카드 사용**: 크롬·엣지에서 그래픽카드(WebGPU)가 보이면 CPU와 함께 2차 판독에 씁니다. CPU보다 느리거나 오류가 나면 자동으로 빼고 CPU로 계속합니다. 끝나면 "그래픽카드가 글줄 N% 판독"이라고 표시됩니다. 주소 뒤에 `?gpu=0`을 붙이면 끕니다.
 - **결과 저장**: 한 번 분석한 파일은 브라우저에 결과가 저장되어, 다시 열면 바로 검색됩니다(최근 30개). "저장된 결과 지우기"로 지울 수 있습니다.
 - **검색 방식**: 띄어쓰기·문장부호·영문 대소문자는 무시합니다. 글자가 조금 틀리게 인식된 비슷한 표현도 찾고, 이런 결과는 점선과 `?`로 구분해 보여줍니다.
 
@@ -22,6 +23,7 @@
 | `models/` | 내장 모델과 라이선스 (아래 표) |
 | `tools/build.py` | 라이브러리·모델을 모두 넣어 `dist/pdf-page-finder.html` 하나로 묶음. 같은 입력이면 같은 결과 |
 | `tools/prune_model.py` | 신경망 모델 경량화에 쓴 스크립트 |
+| `tools/dequant_matmul.py`, `tools/split_external.py` | 그래픽카드용 실수 모델 만들기, 두 모델이 함께 쓰는 가중치(`rec_w.bin`) 나누기 |
 | `tools/fold_affine.py` | 모델의 배율·더하기 층을 합성곱에 합치는 스크립트(결과 같고 더 빠름). `models/rec_small_int8.onnx`에 적용됨 |
 | `tests/regress.js` | 회귀 테스트: 네트워크를 막은 브라우저에서 쪽 찾기·위치 표시·결과 저장 확인 |
 | `tests/bench.js` | 성능 측정: 시간, 키워드 적중률, 글자 정확도 |
@@ -54,7 +56,7 @@ T=table2 node tests/bench.js dist/pdf-page-finder.html
 | pdf.js (`pdfjs-dist`) | 3.11.174 | Apache-2.0 |
 | tesseract.js, tesseract.js-core | 7.0.0 (빌드 때 내장 언어 데이터 이름 버그 한 줄 수정) | Apache-2.0 |
 | 한국어 Tesseract 모델 `models/kor.traineddata` | tesseract-ocr/tessdata_fast (커밋 8741641) | Apache-2.0 |
-| onnxruntime-web | 1.16.3 | MIT |
+| onnxruntime-web | 1.31.1 (CPU용 일반판 + 그래픽카드용 WebGPU판) | MIT |
 | 한국어 신경망 인식 모델 `models/rec_small_int8.onnx` | VerifiedIdiot/korean-handwriting-rec (커밋 7f974fc, PP-OCRv5 한국어 모델 추가 학습판)을 출력층 축소(상용 한글 2,350자·영문·숫자·기호)하고 8비트 경량화, 배율·더하기 층을 합성곱에 합침 | Apache-2.0 |
 
 ## 측정 결과 (4코어, 2026-11-19)
