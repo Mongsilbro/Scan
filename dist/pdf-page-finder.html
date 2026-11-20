@@ -509,6 +509,9 @@
   }
 
   // ---------- 신경망 인식 (PP-OCRv5 한국어) ----------
+  // 메인 스레드가 바빴던 시간(50ms 넘게 막힌 일의 합). 코어가 많은 컴퓨터에서 병목인지 보려고 잼
+  let mainBusy = 0;
+  try { new PerformanceObserver(l => { for (const e of l.getEntries()) mainBusy += e.duration; }).observe({ type: 'longtask', buffered: false }); } catch (e) {}
   const NN = { ok: !!$('a-ort') && CFG.engine !== 'tess', pool: [], res: null };
   const GPU = { state: CFG.gpu === '0' ? 'off' : 'idle', why: CFG.gpu === '0' ? '주소에 ?gpu=0 을 붙여 꺼 둠' : '', w: null, p: null, name: '', speed: 0 };
   const gpuEl = document.createElement('div'); gpuEl.id = 'gpuNote';
@@ -840,7 +843,7 @@
       const lang = 'kor', force = $('force').checked, fine = $('fine').checked;
       await resetPool(lang); analyzedLang = lang;
       let next = 1, done = 0, ocrCount = 0, ocrStart = 0, nnDone = 0, engineNote = '';
-      const t0 = performance.now();
+      const t0 = performance.now(), busy0 = mainBusy;
       // 1단계: 글자 정보가 있으면 그대로, 없으면 빠른 엔진(Tesseract)으로 전체를 훑음 → 바로 검색 가능
       // 2단계: 신경망 엔진(PP-OCRv5)으로 스캔 쪽을 다시 읽어 결과를 보강
       const ocrPages = [], confOf = {};
@@ -958,7 +961,7 @@
       let gpuNote = '';
       if (pool2 && pool2.st.gpuN) gpuNote = ` · 그래픽카드가 글줄 ${Math.round(pool2.st.gpuN / (pool2.st.gpuN + pool2.st.cpuN) * 100)}% 판독`;
       else if (pool2 && ocrCount) gpuNote = ` · 그래픽카드 안 씀(${GPU.state === 'loading' ? '준비가 끝나기 전에 분석이 끝남' : GPU.why || pool2.st.gpuWhy || '쓸 일이 없었음'})`;
-      setStatus(`분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}${gpuNote}`, 'ok');
+      setStatus(`분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}${gpuNote} · 화면 쪽 작업 ${Math.round((mainBusy - busy0) / 1000)}초`, 'ok');
       search();
     } catch (e) {
       if (my !== runId) return;
