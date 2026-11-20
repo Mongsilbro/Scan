@@ -9,7 +9,7 @@ def rep(a, b, s):
     assert s.count(a) == 1, a
     return s.replace(a, b)
 head = rep('<div class="row" style="color:var(--muted)">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>',
- '<div class="row"><label><input type="checkbox" id="fuzzy" checked> 글자가 조금 틀리게 인식된 비슷한 표현도 찾기</label></div>\n    <div class="row" style="color:var(--muted);margin-top:4px">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>', head)
+ '<div class="row"><label><input type="checkbox" id="fuzzy" checked> 글자가 조금 틀리게 인식된 비슷한 표현도 찾기</label></div>\n    <div class="row" style="color:var(--muted);margin-top:4px">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 여러 낱말은 쉼표(,)로 나누면 따로 찾고 모두 들어 있는 쪽도 보여줍니다. 파일을 여러 개 넣으면 모든 파일에서 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>', head)
 head = rep('<label><input type="checkbox" id="force"> 글자 정보가 있어도 항상 OCR 사용</label>',
  '<label><input type="checkbox" id="force"> 글자 정보가 있어도 항상 OCR 사용</label>\n      <label><input type="checkbox" id="fine"> 정밀 인식 (2배쯤 느리지만 작은 글씨·흐린 스캔에 강함)</label>', head)
 i = head.index('      <label>문서 언어'); j = head.index('</label>', head.index('</select>', i)) + len('</label>\n')

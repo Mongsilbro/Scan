@@ -67,6 +67,21 @@
   details { margin-top: 10px; font-size: .9rem; }
   #pvText { white-space: pre-wrap; max-height: 200px; overflow: auto; color: var(--muted); }
   .hidden { display: none; }
+  #docs { margin-top: 10px; display: grid; gap: 4px; }
+  .doc { display: flex; align-items: center; gap: 10px; font-size: .9rem; border-bottom: 1px solid var(--line); padding: 4px 0; }
+  .doc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .doc small { color: var(--muted); white-space: nowrap; }
+  .doc small.err { color: var(--err); white-space: normal; }
+  .doc button { padding: 2px 10px; font-size: .85rem; }
+  .sumrow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .sumrow button { padding: 3px 12px; font-size: .85rem; white-space: nowrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .chip-file { font-size: .85rem; color: var(--muted); font-weight: 600; margin-right: 4px; max-width: 100%; overflow-wrap: anywhere; }
+  .term { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+  .term-head { font-weight: 700; margin-bottom: 6px; }
+  .pv-nav { display: flex; align-items: center; gap: 6px; }
+  .pv-nav small { color: var(--muted); min-width: 5em; text-align: center; }
+  @media (max-width: 560px) { .dlg-head { flex-wrap: wrap; } .doc { flex-wrap: wrap; } }
 </style>
 </head>
 <body>
@@ -78,9 +93,9 @@
     <div class="step">1. PDF 파일 선택</div>
     <div id="drop" tabindex="0" role="button">
       <strong id="dropTitle">여기를 눌러 PDF를 선택하거나, 파일을 끌어다 놓으세요</strong>
-      <span id="dropSub">스캔본 · 일반 PDF 모두 가능</span>
+      <span id="dropSub">스캔본 · 일반 PDF 모두 가능 · 여러 파일 한꺼번에 가능</span>
     </div>
-    <input type="file" id="file" accept="application/pdf,.pdf" class="hidden">
+    <input type="file" id="file" accept="application/pdf,.pdf" class="hidden" multiple>
     <div class="row">
       <label>문서 언어
         <select id="lang">
@@ -99,11 +114,11 @@
   <div class="card">
     <div class="step">2. 찾을 내용 입력</div>
     <div class="searchrow">
-      <input type="text" id="q" placeholder="예: 계약 기간, 손해배상 …" autocomplete="off">
+      <input type="text" id="q" placeholder="예: 계약 기간   (여러 낱말은 쉼표로: 계약 기간, 손해배상)" autocomplete="off">
       <button class="primary" id="go">찾기</button>
     </div>
     <div class="row" style="color:var(--muted)">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>
-    <div id="summary"></div>
+    <div class="sumrow"><div id="summary"></div><button id="copyRes" class="hidden" title="찾은 쪽 번호를 복사">결과 복사</button></div>
     <div id="chips"></div>
     <div id="hits"></div>
   </div>
@@ -112,6 +127,7 @@
 <dialog id="dlg">
   <div class="dlg-head">
     <strong id="pvTitle"></strong>
+    <span class="pv-nav"><button id="pvPrev" title="이전 결과 (←)">◀ 이전</button><small id="pvPos"></small><button id="pvNext" title="다음 결과 (→)">다음 ▶</button></span>
     <button id="pvClose">닫기</button>
   </div>
   <canvas id="pv"></canvas>

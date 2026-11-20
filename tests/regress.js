@@ -64,6 +64,30 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
   check(JSON.stringify(await pagesFor('손해 배상')) === '[3]', '저장된 결과로도 검색됨');
   await t.click('#clearCache');
 
+  console.log('여러 파일·여러 낱말');
+  await t.goto(html + '?nocache=1');
+  await t.setInputFiles('#file', [path.join(FX, 'scan.pdf'), path.join(FX, 'side.pdf')]);
+  await t.waitForFunction(() => document.querySelectorAll('#docs .doc').length === 2 && [...document.querySelectorAll('#docs .doc small')].every(e => /완료/.test(e.textContent)), null, { timeout: 600000 });
+  check(true, '파일 2개 차례로 분석 완료');
+  await t.fill('#q', '보증금 반환 청구'); await t.waitForTimeout(400);
+  const f1 = await t.$$eval('#chips .chips', els => els.map(e => e.textContent));
+  check(f1.length === 1 && /side\.pdf/.test(f1[0]) && /1쪽/.test(f1[0]), `다른 파일의 낱말도 찾음: ${f1}`);
+  await t.fill('#q', '계약기간, 손해 배상'); await t.waitForTimeout(400);
+  const terms = await t.$$eval('#hits .term-head', els => els.map(e => e.textContent));
+  check(terms.length === 3 && /모두 들어 있는 쪽은 없습니다/.test(terms[0]) && /계약기간/.test(terms[1]) && /손해 배상/.test(terms[2]), `낱말 2개 따로 찾기: ${terms.join(' | ')}`);
+  await t.fill('#q', '1,000'); await t.waitForTimeout(400);
+  check(!(await t.$$('#hits .term-head')).length, '숫자 사이 쉼표(1,000)는 낱말을 나누지 않음');
+  await t.fill('#q', '계약기간, 손해 배상'); await t.waitForTimeout(400);
+  await (await t.$('#hits .chip')).click(); await t.waitForTimeout(1200);
+  const pos1 = await t.textContent('#pvPos'); await t.keyboard.press('ArrowRight'); await t.waitForTimeout(1200);
+  const pos2 = await t.textContent('#pvPos'), title2 = await t.textContent('#pvTitle');
+  check(/결과 1\//.test(pos1) && /결과 2\//.test(pos2), `미리보기에서 다음 결과로 넘기기: ${pos1} → ${pos2} (${title2})`);
+  await t.click('#pvClose');
+  const [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc button:text("글자 저장")')]);
+  const txt = require('fs').readFileSync(await dl.path(), 'utf8');
+  check(/===== 2쪽 =====/.test(txt) && txt.length > 100, `인식된 글자 저장 (${txt.length}자)`);
+  check(/분석 완료/.test(await t.title()), `탭 제목: ${await t.title()}`);
+
   console.log('네트워크');
   check(net === 0, `외부 접속 시도 ${net}건`);
   await b.close();
