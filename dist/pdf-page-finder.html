@@ -526,7 +526,7 @@
       const R = await nnRes(), gpu = ep === 'webgpu';
       if (gpu) {        // 그래픽카드가 보일 때만 그래픽카드용 엔진을 풀어 씀
         const a = navigator.gpu && await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
-        if (!a) throw new Error(navigator.gpu ? '그래픽카드를 찾지 못함' : '이 브라우저는 WebGPU를 지원하지 않음');
+        if (!a) throw new Error(navigator.gpu ? '브라우저가 그래픽카드를 내주지 않음 — 주소창에 chrome://gpu (엣지는 edge://gpu) 를 열어 WebGPU 항목 확인' : '이 브라우저는 WebGPU를 지원하지 않음');
         if (!NN.gres) NN.gres = (async () => ({
           url: URL.createObjectURL(new Blob([await asset('a-ortgpu', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
           mjs: new TextDecoder().decode(await asset('a-ortgpumjs', true)), wasm: await asset('a-ortgpuwasm', true), model: await asset('a-recgpu', true) }))();
@@ -1131,7 +1131,7 @@
   // ---------- 그래픽카드 ----------
   // 페이지를 열면 바로 준비하고 속도를 재어 둠. 한 번 준비되면 다음 파일에도 계속 씀
   function gpuShow() {
-    gpuEl.textContent = '그래픽카드: ' + ({ idle: '확인 전', loading: '준비 중… (처음 한 번 수십 초 걸릴 수 있음)',
+    gpuEl.textContent = `이 컴퓨터: 코어 ${cores}개, 동시 작업 ${CFG.workers}개 · 그래픽카드: ` + ({ idle: '확인 전', loading: '준비 중… (처음 한 번 수십 초 걸릴 수 있음)',
       ready: `사용함 — ${GPU.name || '이름 모름'}, 글줄 읽기가 CPU 한 코어보다 약 ${GPU.speed}배 빠름`, off: `안 씀 — ${GPU.why}` })[GPU.state];
   }
   function gpuStart() {
