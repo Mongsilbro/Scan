@@ -20,6 +20,7 @@
 | `src/head.html` | 화면(HTML·CSS) 바탕. 빌드할 때 `tools/build.py`가 일부를 고쳐 씁니다 |
 | `src/main.js` | 전체 동작: PDF 읽기, 전처리, 표 칸 찾기, 글줄 찾기, 두 엔진 판독, 검색, 위치 표시, 결과 저장 |
 | `src/recworker.js` | 신경망 판독 작업자(onnxruntime-web) |
+| `src/imgproc.js`, `src/prepworker.js` | 그림 처리 함수(전처리·표/글줄 찾기·글줄 자르기)와, 그 일을 화면 쪽 대신 하는 준비 작업자 |
 | `models/` | 내장 모델과 라이선스 (아래 표) |
 | `tools/build.py` | 라이브러리·모델을 모두 넣어 `dist/pdf-page-finder.html` 하나로 묶음. 같은 입력이면 같은 결과 |
 | `tools/prune_model.py` | 신경망 모델 경량화에 쓴 스크립트 |
