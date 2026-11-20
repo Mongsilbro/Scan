@@ -22,7 +22,9 @@
   // ---------- 설정 (주소 뒤에 ?dpi=250&workers=2 처럼 붙여 조정 가능) ----------
   const Q = new URLSearchParams(location.search);
   const cores = navigator.hardwareConcurrency || 4;
-  let autoWorkers = Math.max(1, Math.min(8, cores));   // 코어가 많은 컴퓨터는 최대 8개까지 동시 처리
+  // 동시 처리 수: 8코어까지는 코어 수만큼. 코어가 더 많고 메모리가 8GB 이상이면 화면 쪽 일·브라우저 몫으로 4개를 남기고 최대 16개
+  let autoWorkers = Math.max(1, Math.min(8, cores));
+  if (cores > 8 && (navigator.deviceMemory || 8) >= 8) autoWorkers = Math.min(16, Math.max(8, cores - 4));
   if (navigator.deviceMemory && navigator.deviceMemory <= 4) autoWorkers = Math.min(autoWorkers, 2);
   const CFG = {
     dpi: +Q.get('dpi') || 200,
@@ -43,7 +45,7 @@
     ahead: Q.has('ahead') ? +Q.get('ahead') : 1,   // 2차에서 신경망 작업자 수보다 몇 쪽 더 미리 준비할지
     overlap: Q.get('overlap') !== '0',    // 1차 판독이 끝난 작업자부터 바로 2차 판독 시작
     warm: Q.get('warm') !== '0',          // 페이지를 열 때 판독 엔진 미리 준비
-    gpu: Q.get('gpu') || 'auto',          // 그래픽카드(WebGPU) 판독: auto | 0(끄기) | force(느려도·소프트웨어 그래픽이어도 사용, 시험용)
+    gpu: Q.get('gpu') || 'auto',          // 그래픽카드(WebGPU) 판독: auto(인텔 내장 그래픽은 안 씀) | 1(내장 그래픽도 사용) | 0(끄기) | force(느려도·소프트웨어 그래픽이어도 사용, 시험용)
     gpuBatch: +Q.get('gpuBatch') || 16,   // 그래픽카드 작업자가 한 번에 가져가는 최대 글줄 수
     maxPx: 3800
   };
@@ -390,6 +392,10 @@
       const R = await nnRes(), gpu = ep === 'webgpu';
       if (gpu) {        // 그래픽카드가 보일 때만 그래픽카드용 엔진을 풀어 씀
         const a = navigator.gpu && await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
+        const ai = (a && a.info) || {};
+        // 인텔 내장 그래픽은 CPU와 전력·메모리를 나눠 써서 분석 중엔 오히려 느려짐(사용자 컴퓨터에서 확인). 인텔 독립형(Arc, …hpg)은 사용
+        if (a && CFG.gpu === 'auto' && /intel/i.test(ai.vendor || '') && !/hpg/i.test(ai.architecture || ''))
+          throw new Error(`내장 그래픽(${ai.architecture || 'intel'})은 CPU와 전력을 나눠 써서 오히려 느려짐 — 켜려면 주소 끝에 ?gpu=1`);
         if (!a) throw new Error(navigator.gpu ? '브라우저가 그래픽카드를 내주지 않음 — 주소창에 chrome://gpu (엣지는 edge://gpu) 를 열어 WebGPU 항목 확인' : '이 브라우저는 WebGPU를 지원하지 않음');
         if (!NN.gres) NN.gres = (async () => ({
           url: URL.createObjectURL(new Blob([await asset('a-ortgpu', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
