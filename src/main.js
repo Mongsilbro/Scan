@@ -45,6 +45,7 @@
     ahead: Q.has('ahead') ? +Q.get('ahead') : 1,   // 2차에서 신경망 작업자 수보다 몇 쪽 더 미리 준비할지
     overlap: Q.get('overlap') !== '0',    // 1차 판독이 끝난 작업자부터 바로 2차 판독 시작
     warm: Q.get('warm') !== '0',          // 페이지를 열 때 판독 엔진 미리 준비
+    prepw: Q.get('prepw') !== '0',        // 전처리·표/글줄 찾기·글줄 자르기를 준비 작업자에게 맡김
     gpu: Q.get('gpu') || 'auto',          // 그래픽카드(WebGPU) 판독: auto(인텔 내장 그래픽은 안 씀) | 1(내장 그래픽도 사용) | 0(끄기) | force(느려도·소프트웨어 그래픽이어도 사용, 시험용)
     gpuBatch: +Q.get('gpuBatch') || 16,   // 그래픽카드 작업자가 한 번에 가져가는 최대 글줄 수
     maxPx: 3800
@@ -121,50 +122,26 @@
     await page.render({ canvasContext: ctx, viewport: vp }).promise;
     return canvas;
   }
-  // 흑백 변환 + 배경(종이색)을 흰색으로, 글자를 검게 늘려 대비를 높임
-  function enhance(canvas) {
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const im = ctx.getImageData(0, 0, canvas.width, canvas.height), d = im.data;
-    const hist = new Uint32Array(256); const n = d.length / 4;
-    for (let i = 0; i < d.length; i += 4) { const g = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; d[i] = g; hist[g]++; }
-    let lo = 0, hi = 255, acc = 0;
-    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.005) { lo = v; break; } }
-    acc = 0;
-    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.5) { hi = v; break; } }
-    hi = Math.max(lo + 1, hi - 6);
-    const ok = hi - lo >= 50;          // 대비가 거의 없는 쪽(빈 쪽, 어두운 바탕)은 흑백 변환만
-    const lut = new Uint8ClampedArray(256);
-    for (let v = 0; v < 256; v++) lut[v] = ok ? (v - lo) * 255 / (hi - lo) : v;
-    for (let i = 0; i < d.length; i += 4) { const g = lut[d[i]]; d[i] = d[i + 1] = d[i + 2] = g; }
-    ctx.putImageData(im, 0, 0);
-  }
-  function rotated(canvas, deg) {
-    const c = document.createElement('canvas'); const q = deg % 180 !== 0;
-    c.width = q ? canvas.height : canvas.width; c.height = q ? canvas.width : canvas.height;
-    const ctx = c.getContext('2d');
-    ctx.translate(c.width / 2, c.height / 2); ctx.rotate(deg * Math.PI / 180);
-    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
-    return c;
-  }
-  // 글줄 방향 추정: 가로줄이면 행 방향 농도 변화가 크고, 옆으로 누운 스캔이면 열 방향 변화가 큼
-  function linesAreVertical(canvas) {
-    const s = 600 / Math.max(canvas.width, canvas.height);
-    const w = Math.max(8, Math.round(canvas.width * s)), h = Math.max(8, Math.round(canvas.height * s));
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(canvas, 0, 0, w, h);
-    const d = ctx.getImageData(0, 0, w, h).data;
-    let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i];
-    const thr = sum / (w * h) * 0.8;
-    const rows = new Float32Array(h), cols = new Float32Array(w);
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (d[(y * w + x) * 4] < thr) { rows[y]++; cols[x]++; }
-    const rough = (a, norm) => { let r = 0; for (let i = 1; i < a.length; i++) { const v = (a[i] - a[i - 1]) / norm; r += v * v; } return r / a.length; };
-    const rr = rough(rows, w), rc = rough(cols, h);
-    return rc > rr * 2.5 && rc > 1e-5;
-  }
+  const IP = makeImgProc(CFG, () => document.createElement('canvas'), { line: (g, wout, flip, lineCv) => {
+    if (Q.get('dumpg') && !flip) (window.__g = window.__g || []).push({ w: wout, g: g.slice() });   // 시험용: 신경망에 넣은 글줄 그림 저장
+    if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
+  } });
+  const { enhance, rotated, linesAreVertical, segment, tableImages } = IP;
   const OUT = { text: true, blocks: false, hocr: false, tsv: false };
-  async function recog(w, canvas, deg) {
-    const c = deg ? rotated(canvas, deg) : canvas;
-    const r = (await w.recognize(c, { rotateAuto: CFG.rot }, OUT)).data;
+  // 그림을 압축 없는 회색 PGM 으로 넘김: 캔버스를 넘기면 PNG 로 압축(화면 쪽)하고 작업자가 다시 푸느라 시간이 듦. 픽셀은 같음
+  // 그림은 캔버스이거나, 준비 작업자가 보낸 회색 값 { width, height, gray, vertical }
+  function toPGM(img) {
+    const W = img.width, H = img.height, head = new TextEncoder().encode(`P5\n${W} ${H}\n255\n`);
+    if (img.gray) return new Blob([head, img.gray]);
+    const d = img.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data, out = new Uint8Array(W * H);
+    for (let i = 0; i < out.length; i++) out[i] = d[i * 4];
+    return new Blob([head, out]);
+  }
+  const asCanvas = img => img.gray ? (img.cv || (img.cv = IP.canvasOf(img))) : img;
+  const free = img => { if (img.gray) { if (img.cv) img.cv.width = img.cv.height = 0; img.gray = img.cv = null; } else img.width = img.height = 0; };
+  async function recog(w, img, deg) {
+    const c = deg ? rotated(asCanvas(img), deg) : img;
+    const r = (await w.recognize(toPGM(c), { rotateAuto: CFG.rot }, OUT)).data;
     if (deg) c.width = c.height = 0;
     const text = r.text || '', conf = r.confidence || 0;
     // 품질 점수: 신뢰도 × 제대로 된 글자(한글 음절·영문자) 비율. 뒤집힌 글자는 숫자·기호로 읽혀 점수가 낮아짐
@@ -178,8 +155,9 @@
     if (knownDeg !== undefined) return recog(w, canvas, knownDeg);
     const better = (a, b) => (b.score > a.score * 1.1 ? b : a);
     let best;
-    if (Q.get('debug')) console.log('linesAreVertical', linesAreVertical(canvas));
-    if (linesAreVertical(canvas)) {          // 옆으로 누운 쪽: 두 방향을 모두 읽어 더 잘 읽힌 쪽 선택
+    const vertical = canvas.vertical !== undefined ? canvas.vertical : linesAreVertical(asCanvas(canvas));
+    if (Q.get('debug')) console.log('linesAreVertical', vertical);
+    if (vertical) {          // 옆으로 누운 쪽: 두 방향을 모두 읽어 더 잘 읽힌 쪽 선택
       // 방향 판별은 한 덩어리 방식이 안정적이라 그 방식으로 먼저 가늠한 뒤, 정해진 방향으로 본 판독
       const psm = w.__psm; await setPsm(w, '6');
       const r90 = await recog(w, canvas, 90), r270 = await recog(w, canvas, 270), probe = r270.score > r90.score ? r270 : r90;
@@ -198,178 +176,69 @@
     return best;
   }
 
-  // ---------- 표 인식 ----------
-  // 잡티 제거 → 표 선 찾아 지우기 → 선으로 둘러싸인 칸 찾기. canvas 를 그 자리에서 정리하고 칸 목록을 돌려줌
-  function segment(canvas, dpi) {
-    const W = canvas.width, H = canvas.height, N = W * H, sc = dpi / 200;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const im = ctx.getImageData(0, 0, W, H), d = im.data;
-    // Otsu 2값화
-    const hist = new Uint32Array(256);
-    for (let p = 0; p < N; p++) hist[d[p * 4]]++;
-    let sum = 0; for (let v = 0; v < 256; v++) sum += v * hist[v];
-    let sumB = 0, wB = 0, best = 0, thr = 128;
-    for (let v = 0; v < 256; v++) {
-      wB += hist[v]; if (!wB) continue; const wF = N - wB; if (!wF) break;
-      sumB += v * hist[v]; const diff = sumB / wB - (sum - sumB) / wF, between = wB * wF * diff * diff;
-      if (between > best) { best = between; thr = v; }
-    }
-    const bin = new Uint8Array(N); let ink = 0;
-    for (let p = 0; p < N; p++) if (d[p * 4] <= thr) { bin[p] = 1; ink++; }
-    if (ink > N * 0.5 || ink < 50) return null;       // 어두운 바탕이거나 빈 쪽
-    const erase = p => { bin[p] = 0; const i = p * 4; d[i] = d[i + 1] = d[i + 2] = 255; };
-
-    // 1) 잡티 제거: 가로·세로 모두 아주 작은 점 덩어리
-    const maxDim = Math.max(2, Math.round(3 * sc)), cap = maxDim * maxDim + 1;
-    const seen = new Uint8Array(N), stack = new Int32Array(N), keep = new Int32Array(cap), hs = [];
-    for (let p0 = 0; p0 < N; p0++) {
-      if (!bin[p0] || seen[p0]) continue;
-      let sp = 0, cnt = 0, x0 = W, x1 = 0, y0 = H, y1 = 0; stack[sp++] = p0; seen[p0] = 1;
-      while (sp) {
-        const p = stack[--sp], x = p % W, y = (p - x) / W;
-        if (cnt < cap) keep[cnt] = p; cnt++;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= H) continue;
-          for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= W) continue;
-            const q = yy * W + xx; if (bin[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; } } }
-      }
-      if (x1 - x0 < maxDim && y1 - y0 < maxDim && cnt < cap) for (let k = 0; k < cnt; k++) erase(keep[k]);
-      else { const bh = y1 - y0 + 1; if (bh >= 6 * sc && bh <= 120 * sc && x1 - x0 <= 160 * sc) hs.push(bh); }
-    }
-
-    // 2) 표 선: 길게 이어진 가로·세로 줄 (기울어진 선도 잡도록 이웃 1픽셀까지 함께 봄)
-    const line = new Uint8Array(N), minRun = Math.round(80 * sc); let linePx = 0;
-    for (let y = 1; y < H - 1; y++) { const o = y * W; let run = 0;
-      for (let x = 0; x <= W; x++) {
-        if (x < W && (bin[o + x] | bin[o + x - W] | bin[o + x + W])) { run++; continue; }
-        if (run >= minRun) { linePx += run; for (let k = x - run; k < x; k++) { line[o + k] |= 1; line[o + k - W] |= 1; line[o + k + W] |= 1; } }
-        run = 0;
-      } }
-    for (let x = 1; x < W - 1; x++) { let run = 0;
-      for (let y = 0; y <= H; y++) { const p = y * W + x;
-        if (y < H && (bin[p] | bin[p - 1] | bin[p + 1])) { run++; continue; }
-        if (run >= minRun) { linePx += run; for (let k = y - run; k < y; k++) { const q = k * W + x; line[q] |= 2; line[q - 1] |= 2; line[q + 1] |= 2; } }
-        run = 0;
-      } }
-    const cells = [];
-    const G = 4, gw = Math.ceil(W / G), gh = Math.ceil(H / G);
-    const label = new Int32Array(gw * gh);
-    if (linePx >= minRun * 8) {
-      // 3) 격자(4픽셀 단위)에서 선을 벽으로 삼아 칸을 찾음. 끊어진 선은 이어 붙임
-      const hm = new Uint8Array(gw * gh), vm = new Uint8Array(gw * gh);
-      for (let p = 0; p < N; p++) { const l = line[p]; if (!l) continue;
-        if (bin[p]) erase(p);
-        const x = p % W, g = ((p - x) / W / G | 0) * gw + (x / G | 0);
-        if (l & 1) hm[g] = 1; if (l & 2) vm[g] = 1; }
-      const gap = Math.round(12 * sc), ext = 2;
-      for (let y = 0; y < gh; y++) { let last = -1; const o = y * gw;
-        for (let x = 0; x < gw; x++) if (hm[o + x] === 1) { if (last >= 0 && x - last - 1 <= gap) for (let k = last + 1; k < x; k++) hm[o + k] = 2; last = x; }
-        for (let x = 0; x < gw; x++) if (hm[o + x] && hm[o + x] < 3) for (let k = Math.max(0, x - ext); k <= Math.min(gw - 1, x + ext); k++) if (!hm[o + k]) hm[o + k] = 3; }
-      for (let x = 0; x < gw; x++) { let last = -1;
-        for (let y = 0; y < gh; y++) if (vm[y * gw + x] === 1) { if (last >= 0 && y - last - 1 <= gap) for (let k = last + 1; k < y; k++) vm[k * gw + x] = 2; last = y; }
-        for (let y = 0; y < gh; y++) { const v = vm[y * gw + x]; if (v && v < 3) for (let k = Math.max(0, y - ext); k <= Math.min(gh - 1, y + ext); k++) if (!vm[k * gw + x]) vm[k * gw + x] = 3; } }
-      for (let g = 0; g < gw * gh; g++) if (hm[g] || vm[g]) label[g] = -1;
-      const queue = new Int32Array(gw * gh); let id = 0;
-      for (let g0 = 0; g0 < gw * gh; g0++) {
-        if (label[g0]) continue;
-        id++; let qh = 0, qt = 0, cnt = 0, x0 = gw, x1 = 0, y0 = gh, y1 = 0; queue[qt++] = g0; label[g0] = id;
-        while (qh < qt) {
-          const g = queue[qh++], x = g % gw, y = (g - x) / gw; cnt++;
-          if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-          if (x > 0 && !label[g - 1]) { label[g - 1] = id; queue[qt++] = g - 1; }
-          if (x < gw - 1 && !label[g + 1]) { label[g + 1] = id; queue[qt++] = g + 1; }
-          if (y > 0 && !label[g - gw]) { label[g - gw] = id; queue[qt++] = g - gw; }
-          if (y < gh - 1 && !label[g + gw]) { label[g + gw] = id; queue[qt++] = g + gw; }
-        }
-        const bw = x1 - x0 + 1, bh = y1 - y0 + 1, area = bw * bh;
-        if (area <= gw * gh * 0.5 && cnt / area >= 0.6 && bw * G >= 30 * sc && bh * G >= 20 * sc)
-          cells.push({ id, x0: x0 * G, y0: y0 * G, x1: Math.min(W, (x1 + 1) * G), y1: Math.min(H, (y1 + 1) * G) });
-      }
-      // 칸 안에서 글자가 있는 범위
-      const isCell = new Uint8Array(id + 1);
-      for (const c of cells) {
-        let ax0 = W, ax1 = -1, ay0 = H, ay1 = -1, n = 0;
-        for (let y = c.y0; y < c.y1; y++) { const go = (y / G | 0) * gw, o = y * W;
-          for (let x = c.x0; x < c.x1; x++) if (bin[o + x] && label[go + (x / G | 0)] === c.id) {
-            n++; if (x < ax0) ax0 = x; if (x > ax1) ax1 = x; if (y < ay0) ay0 = y; if (y > ay1) ay1 = y; } }
-        c.ink = n; c.ax0 = ax0; c.ax1 = ax1; c.ay0 = ay0; c.ay1 = ay1;
-      }
-      const useful = cells.filter(c => c.ink >= 12 * sc * sc);
-      cells.length = 0;
-      if (useful.length >= 4) {       // 글자가 든 칸이 넷 이상일 때만 표로 취급
-        const tol = 28 * sc;
-        useful.sort((a, b) => a.y0 - b.y0);
-        let row = [], top = -1e9;
-        const flush = () => { row.sort((a, b) => a.x0 - b.x0); for (const c of row) cells.push(c); row = []; };
-        for (const c of useful) { if (c.y0 - top > tol) { flush(); top = c.y0; } row.push(c); }
-        flush();
-        for (const c of cells) isCell[c.id] = 1;
-      }
-      var cellMask = isCell;
-    }
-    ctx.putImageData(im, 0, 0);
-    hs.sort((a, b) => a - b);
-    const hchar = hs.length ? hs[Math.floor(hs.length * 0.7)] : 24 * sc;      // 대표 글자 높이
-    return { cells, d, bin, label, isCell: cellMask, W, H, G, gw, gh, sc, line, hchar };
-  }
-
-  // 칸들을 세로로 이어 붙인 그림(들)과, 칸 밖 글자만 남긴 그림을 만듦
-  function tableImages(seg) {
-    const { cells, d, bin, label, isCell, W, H, G, gw, sc } = seg;
-    const pad = Math.round(14 * sc), gapY = Math.round(34 * sc), maxH = Math.round(5200 * sc);
-    const strips = []; let cur = null;
-    const stripW = Math.max(...cells.map(c => c.ax1 - c.ax0 + 1)) + pad * 2;
-    for (const c of cells) {
-      const h = c.ay1 - c.ay0 + 1;
-      if (!cur || cur.h + h + gapY > maxH) { cur = { items: [], h: pad }; strips.push(cur); }
-      cur.items.push({ c, y: cur.h }); cur.h += h + gapY;
-    }
-    const canvases = strips.map(s => {
-      const cv = document.createElement('canvas'); cv.width = stripW; cv.height = s.h;
-      const cx = cv.getContext('2d'); const out = cx.createImageData(stripW, s.h), o = out.data; o.fill(255);
-      for (const { c, y: ty } of s.items) for (let y = c.ay0; y <= c.ay1; y++) { const go = (y / G | 0) * gw;
-        for (let x = c.ax0; x <= c.ax1; x++) { const l = label[go + (x / G | 0)];
-          if (l !== c.id && l !== -1) continue;        // 기울어진 표에서 이웃 칸 글자가 끼어들지 않게 함
-          const v = d[(y * W + x) * 4], i = ((ty + y - c.ay0) * stripW + pad + x - c.ax0) * 4; o[i] = o[i + 1] = o[i + 2] = v; } }
-      cx.putImageData(out, 0, 0); return cv;
-    });
-    // 칸 밖(제목·본문·쪽 번호)
-    let restInk = 0; const rest = document.createElement('canvas'); rest.width = W; rest.height = H;
-    const rx = rest.getContext('2d'); const ro = rx.createImageData(W, H), r = ro.data;
-    for (let y = 0; y < H; y++) { const go = (y / G | 0) * gw;
-      for (let x = 0; x < W; x++) { const p = y * W + x, i = p * 4, l = label[go + (x / G | 0)];
-        const inCell = l > 0 && isCell[l]; const v = inCell ? 255 : d[i];
-        r[i] = r[i + 1] = r[i + 2] = v; r[i + 3] = 255; if (!inCell && bin[p]) restInk++; } }
-    rx.putImageData(ro, 0, 0);
-    return { strips: canvases, rest, restInk };
-  }
-
   async function setPsm(w, v) { if (w.__psm !== v) { await w.setParameters({ tessedit_pageseg_mode: v }); w.__psm = v; } }
   // 표가 있는 쪽: 칸 밖은 일반 방식으로, 칸 안은 칸 단위로 읽음. 잘 안 읽히면 null (일반 방식으로 되돌아감)
-  async function ocrTable(w, seg, psm) {
-    const t = tableImages(seg); const parts = []; let conf = 0, n = 0;
-    if (t.restInk > 80 * seg.sc * seg.sc) { await setPsm(w, psm); parts.push((await recog(w, t.rest, 0)).text); }
+  async function ocrTable(w, t, psm) {
+    const parts = []; let conf = 0, n = 0;
+    if (t.restInk > 80 * t.sc * t.sc) { await setPsm(w, psm); parts.push((await recog(w, t.rest, 0)).text); }
     await setPsm(w, CFG.psmc);
     let ratio = 0;
-    for (const s of t.strips) { const r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; s.width = s.height = 0; }
-    t.rest.width = t.rest.height = 0;
+    for (const s of t.strips) { const r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; free(s); }
+    free(t.rest);
     if (!n || conf / n < 45 || ratio / n < 0.35) return null;
     return { text: parts.join('\n'), deg: 0, table: true, conf: conf / n };
   }
-  // 한 쪽을 그려서 읽음
+  // 한 쪽을 그려서 읽음. 그린 뒤 전처리·표 찾기는 준비 작업자가 하고(있으면) 화면 쪽은 그리기만 함
   async function ocrPage(w, page, dpi, psm, knownDeg) {
+    if (PREP.on) try { return await ocrPageWith(true, w, page, dpi, psm, knownDeg); } catch (e) { prepFail(e); }
+    return ocrPageWith(false, w, page, dpi, psm, knownDeg);
+  }
+  async function ocrPageWith(remote, w, page, dpi, psm, knownDeg) {
     const P0 = performance.now();
     const canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
     const P1 = performance.now();
-    if (CFG.prep) enhance(canvas);
-    let res = null; const P2 = performance.now();
-    const seg = CFG.table ? segment(canvas, dpi) : null;
-    if (Q.get('debug')) console.log(`1차 render ${(P1 - P0) | 0}ms enhance ${(P2 - P1) | 0}ms segment ${(performance.now() - P2) | 0}ms`);
-    if (seg && seg.cells.length && !knownDeg) res = await ocrTable(w, seg, psm);
-    if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, canvas, knownDeg); res.canvas = canvas; }
-    else canvas.width = canvas.height = 0;
+    let pr;     // { img: 정리한 쪽 그림, table: { rest, strips, restInk, sc } | null }
+    if (remote) pr = await PREP.call('p1', canvas, { dpi, prep: CFG.prep, table: CFG.table, useTable: !knownDeg });
+    else {
+      if (CFG.prep) enhance(canvas);
+      const seg = CFG.table ? segment(canvas, dpi) : null;
+      pr = { img: canvas, table: seg && seg.cells.length && !knownDeg ? Object.assign(tableImages(seg), { sc: seg.sc }) : null };
+    }
+    if (Q.get('debug')) console.log(`1차 render ${(P1 - P0) | 0}ms 전처리·표 찾기${remote ? '(작업자)' : ''} ${(performance.now() - P1) | 0}ms`);
+    let res = pr.table ? await ocrTable(w, pr.table, psm) : null;
+    if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, pr.img, knownDeg); res.canvas = pr.img; }
+    else free(pr.img);
     return res;
   }
+
+  // ---------- 준비 작업자: 그린 쪽의 전처리·표/글줄 찾기·글줄 자르기를 화면 쪽 대신 함 ----------
+  // 코어가 많은 컴퓨터에서 화면 쪽(메인 스레드)이 막혀 작업자들이 기다리는 것을 막음
+  const PREP = { on: CFG.prepw && typeof OffscreenCanvas !== 'undefined' && !Q.get('dumpg') && !Q.get('crops'), ws: [], seq: 0, src: null };
+  function prepFail(e) { console.warn('준비 작업자를 쓸 수 없어 화면 쪽에서 처리:', e); PREP.on = false; PREP.ws.forEach(x => x.w.terminate()); PREP.ws = []; }
+  PREP.get = async () => {    // 할 일이 가장 적은 작업자 (처음 부를 때 만듦)
+    if (!PREP.ws.length) {
+      if (!PREP.src) PREP.src = new TextDecoder().decode(await asset('a-prepworker', true));
+      if (PREP.ws.length) return PREP.ws.reduce((a, b) => b.load < a.load ? b : a);
+      const url = URL.createObjectURL(new Blob(['const makeImgProc = ' + makeImgProc.toString() + ';\n', PREP.src], { type: 'text/javascript' }));
+      for (let i = 0; i < Math.max(1, Math.round(CFG.workers / 6)); i++) {
+        const w = new Worker(url), x = { w, load: 0, pend: new Map() };
+        w.onmessage = e => { const p = x.pend.get(e.data.id); if (!p) return; x.pend.delete(e.data.id); x.load--; e.data.error ? p.no(new Error(e.data.error)) : p.ok(e.data); };
+        w.onerror = e => { for (const p of x.pend.values()) p.no(new Error(e.message || '준비 작업자 오류')); x.pend.clear(); };
+        w.postMessage({ type: 'init', cfg: CFG });
+        PREP.ws.push(x);
+      }
+    }
+    return PREP.ws.reduce((a, b) => b.load < a.load ? b : a);
+  };
+  PREP.send = (x, m, tr) => new Promise((ok, no) => { m.id = ++PREP.seq; x.load++; x.pend.set(m.id, { ok, no }); x.w.postMessage(m, tr || []); });
+  // 그린 캔버스의 픽셀을 작업자로 넘기고(캔버스는 비움) 결과를 받음
+  PREP.call = async (type, canvas, extra) => {
+    const x = await PREP.get();
+    const W = canvas.width, H = canvas.height, buf = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data.buffer;
+    canvas.width = canvas.height = 0;
+    const r = await PREP.send(x, Object.assign({ type, W, H, buf }, extra), [buf]);
+    r.x = x; return r;
+  };
 
   // ---------- 신경망 인식 (PP-OCRv5 한국어) ----------
   // 메인 스레드가 바빴던 시간(50ms 넘게 막힌 일의 합). 코어가 많은 컴퓨터에서 병목인지 보려고 잼
@@ -465,144 +334,21 @@
     };
   }
 
-  // 글줄 찾기: 글자를 가로로 번지게 해서 이어진 덩어리를 한 줄로 봄 (표 선은 넘지 않음). 줄마다 기울기도 구함
-  function textLines(seg) {
-    const { bin, line, W, H, hchar, label, isCell, G, gw } = seg;
-    const hw = W >> 1, hh = H >> 1, n2 = hw * hh;
-    const sm = new Uint8Array(n2), bar = new Uint8Array(n2);
-    for (let y = 0; y < hh; y++) { const o = y * hw, p0 = 2 * y * W;
-      for (let x = 0; x < hw; x++) { const p = p0 + 2 * x;
-        if (bin[p] | bin[p + 1] | bin[p + W] | bin[p + W + 1]) sm[o + x] = 1;
-        if (line[p] | line[p + 1] | line[p + W] | line[p + W + 1]) bar[o + x] = 1; } }
-    const gapMax = Math.max(3, Math.round(hchar * CFG.gap / 2));
-    for (let y = 0; y < hh; y++) { const o = y * hw; let last = -1;
-      for (let x = 0; x < hw; x++) {
-        if (bar[o + x]) { last = -1; continue; }
-        if (sm[o + x] === 1) { if (last >= 0 && x - last > 1 && x - last - 1 <= gapMax) for (let k = last + 1; k < x; k++) sm[o + k] = 2; last = x; }
-      } }
-    // 덩어리 표시 + 통계
-    const lab = new Int32Array(n2), stack = new Int32Array(n2), comps = [null];
-    for (let p0 = 0; p0 < n2; p0++) {
-      if (!sm[p0] || lab[p0]) continue;
-      const id = comps.length; let sp = 0, n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, x0 = hw, x1 = 0, y0 = hh, y1 = 0;
-      stack[sp++] = p0; lab[p0] = id;
-      while (sp) {
-        const p = stack[--sp], x = p % hw, y = (p - x) / hw;
-        n++; sx += x; sy += y; sxx += x * x; sxy += x * y;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= hh) continue;
-          for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= hw) continue;
-            const q = yy * hw + xx; if (sm[q] && !lab[q]) { lab[q] = id; stack[sp++] = q; } } }
-      }
-      let b = 0; const wd = x1 - x0 + 1, ht = y1 - y0 + 1, den = n * sxx - sx * sx;
-      if (wd > 4 * ht && wd > 30 && den > 0) b = Math.max(-0.08, Math.min(0.08, (n * sxy - sx * sy) / den));
-      comps.push({ id, n, x0, x1, y0, y1, b, r0: 1e9, r1: -1e9 });
-    }
-    for (let p = 0; p < n2; p++) { const id = lab[p]; if (!id) continue; const c = comps[id], x = p % hw, r = (p - x) / hw - c.b * x; if (r < c.r0) c.r0 = r; if (r > c.r1) c.r1 = r; }
-    const minT = hchar * 0.45 / 2, minL = hchar * 0.6 / 2;
-    let cand = comps.filter(c => c && c.r1 - c.r0 + 1 >= minT && c.x1 - c.x0 + 1 >= minL);
-    if (!cand.length) return [];
-    const ts = cand.filter(c => c.x1 - c.x0 > 3 * (c.r1 - c.r0)).map(c => c.r1 - c.r0 + 1).sort((a, b) => a - b);
-    const medT = ts.length ? ts[ts.length >> 1] : hchar / 2;
-    // 위아래 줄이 붙어 버린 덩어리는 가로 농도 골짜기에서 나눔
-    const tall = new Map();
-    for (const c of cand) if (c.r1 - c.r0 + 1 > medT * 1.75) tall.set(c.id, new Int32Array(Math.ceil(c.r1 - c.r0 + 2)));
-    if (tall.size) for (let p = 0; p < n2; p++) { const h = tall.get(lab[p]); if (!h || sm[p] !== 1) continue; const c = comps[lab[p]], x = p % hw; h[Math.round((p - x) / hw - c.b * x - c.r0)]++; }
-    const out = [];
-    for (const c of cand) {
-      const h = tall.get(c.id); let parts = [[c.r0, c.r1]];
-      if (h) {
-        let mx = 0; for (const v of h) if (v > mx) mx = v;
-        const cuts = []; let i = 0;
-        while (i < h.length) { if (h[i] <= mx * 0.1) { let j = i; while (j < h.length && h[j] <= mx * 0.1) j++; if (i > 0 && j < h.length) cuts.push((i + j - 1) / 2); i = j; } else i++; }
-        if (cuts.length) { parts = []; let a = 0; for (const k of cuts.concat([h.length - 1])) { if (k - a + 1 >= minT) parts.push([c.r0 + a, c.r0 + k]); a = k + 1; } }
-      }
-      for (const [r0, r1] of parts) {
-        const x0 = c.x0 * 2, x1 = c.x1 * 2 + 1, t = (r1 - r0 + 1) * 2, cx = (x0 + x1) / 2, cy = r0 * 2 + c.b * cx + t / 2;
-        const lb = label[Math.min(seg.gh - 1, Math.max(0, cy / G | 0)) * gw + Math.min(gw - 1, cx / G | 0)];
-        out.push({ x0, x1, b: c.b, rTop: r0 * 2, t, cx, cy, cell: lb > 0 && isCell && isCell[lb] ? lb : 0 });
-      }
-    }
-    return out;
-  }
-
-  // 읽는 순서: 표 칸이나 문단 단위로 묶고, 묶음 안에서는 위→아래, 왼→오른쪽
-  function orderLines(lines, seg) {
-    const par = lines.map((_, i) => i), find = i => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
-    const cellRoot = new Map();
-    const idx = lines.map((_, i) => i).sort((a, b) => lines[a].cy - lines[b].cy);
-    for (let ii = 0; ii < idx.length; ii++) { const i = idx[ii], A = lines[i];
-      if (A.cell) { if (cellRoot.has(A.cell)) par[find(i)] = find(cellRoot.get(A.cell)); else cellRoot.set(A.cell, i); continue; }
-      for (let jj = ii + 1; jj < idx.length; jj++) { const j = idx[jj], B = lines[j];
-        const dy = B.cy - A.cy; if (dy > (A.t + B.t) * 1.5) break;
-        if (B.cell) continue;
-        const ov = Math.min(A.x1, B.x1) - Math.max(A.x0, B.x0);
-        if (ov >= 0.4 * Math.min(A.x1 - A.x0, B.x1 - B.x0) || (dy < Math.min(A.t, B.t) * 0.5 && -ov < 3 * Math.max(A.t, B.t))) par[find(j)] = find(i);
-      } }
-    const groups = new Map();
-    lines.forEach((l, i) => { const r = find(i); let g = groups.get(r); if (!g) groups.set(r, g = { lines: [], x0: 1e9, y0: 1e9 }); g.lines.push(l); g.x0 = Math.min(g.x0, l.x0); g.y0 = Math.min(g.y0, l.cy - l.t / 2); });
-    const gs = [...groups.values()], tol = 28 * seg.sc;
-    gs.sort((a, b) => a.y0 - b.y0);
-    const ordered = []; let row = [], top = -1e9;
-    const flush = () => { row.sort((a, b) => a.x0 - b.x0); ordered.push(...row); row = []; };
-    for (const g of gs) { if (g.y0 - top > tol) { flush(); top = g.y0; } row.push(g); }
-    flush();
-    for (const g of ordered) g.lines.sort((a, b) => Math.abs(a.cy - b.cy) < Math.min(a.t, b.t) * 0.5 ? a.x0 - b.x0 : a.cy - b.cy);
-    return ordered;
-  }
-
-  // 한 줄을 기울기에 맞춰 펴서 높이 48 픽셀 입력으로 만듦
-  const lineCv = document.createElement('canvas'); lineCv.width = 2400; lineCv.height = 48;
-  const lineCx = lineCv.getContext('2d', { willReadFrequently: true });
-  function lineTensor(src, ln, flip) {
-    const th = Math.atan(ln.b), cos = Math.cos(th), sin = Math.sin(th);
-    const pad = Math.round(ln.t * CFG.pad) + 2, hgt = ln.t + 2 * pad, len = (ln.x1 - ln.x0 + 1) / cos + 2 * pad;
-    const s = 48 / hgt, wout = Math.max(16, Math.min(2400, Math.round(len * s * CFG.squeeze))), sx = wout / len;
-    const ox = ln.x0, oy = ln.rTop + ln.b * ln.x0;
-    const a = sx * cos, c = sx * sin, b = -s * sin, d = s * cos;
-    lineCx.setTransform(1, 0, 0, 1, 0, 0); lineCx.fillStyle = '#fff'; lineCx.fillRect(0, 0, wout, 48);
-    lineCx.imageSmoothingEnabled = true; lineCx.imageSmoothingQuality = 'high';
-    lineCx.save(); lineCx.beginPath(); lineCx.rect(0, 0, wout, 48); lineCx.clip();
-    lineCx.setTransform(a, b, c, d, pad * sx - (a * ox + c * oy), pad * s - (b * ox + d * oy));
-    const m = pad + 6, bx = Math.max(0, Math.floor(ln.x0 - m)), bw = Math.min(src.width, Math.ceil(ln.x1 + m)) - bx;
-    const yA = oy - m - Math.abs(ln.b) * (ln.x1 - ln.x0), by = Math.max(0, Math.floor(yA)), bh = Math.min(src.height, Math.ceil(oy + ln.t + m + Math.abs(ln.b) * (ln.x1 - ln.x0))) - by;
-    if (bw > 0 && bh > 0) lineCx.drawImage(src, bx, by, bw, bh, bx, by, bw, bh);
-    lineCx.restore();
-    const px = lineCx.getImageData(0, 0, wout, 48).data, n = wout * 48, data = new Float32Array(3 * n);
-    let g = new Uint8Array(n); for (let i = 0; i < n; i++) g[i] = px[i * 4];
-    for (let k = 0; k < CFG.thin; k++) {       // 굵게 뭉친 획을 조금 가늘게 (밝은 쪽으로 최대값 필터)
-      const o = new Uint8Array(n);
-      for (let y = 0; y < 48; y++) for (let x = 0; x < wout; x++) { const i = y * wout + x; let v = g[i];
-        if (x > 0 && g[i - 1] > v) v = g[i - 1]; if (x < wout - 1 && g[i + 1] > v) v = g[i + 1];
-        if (y > 0 && g[i - wout] > v) v = g[i - wout]; if (y < 47 && g[i + wout] > v) v = g[i + wout]; o[i] = v; }
-      g = o; }
-    for (let i = 0; i < n; i++) { const v = g[flip ? n - 1 - i : i] / 127.5 - 1; data[i] = data[n + i] = data[2 * n + i] = v; }
-    if (Q.get('dumpg') && !flip) (window.__g = window.__g || []).push({ w: wout, g: g.slice() });   // 시험용: 신경망에 넣은 글줄 그림 저장
-    if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
-    return { w: wout, data };
-  }
-
-  // 그림 한 장을 읽음. sample 을 주면 긴 줄 몇 개만 읽어 방향 판별용 신뢰도만 구함
-  async function nnRead(nw, canvas, dpi, sample, flip) {
+  // 쪽 하나(돌린 상태 그대로)를 읽음. sample 을 주면 긴 줄 몇 개만 읽어 방향 판별용 신뢰도만 구함
+  async function nnRead(nw, h, sample) {
     const T0 = performance.now();
-    const seg = segment(canvas, dpi); if (!seg) return null;
+    const pr = await h.read(sample); if (!pr) return null;
     const T1 = performance.now();
-    const lines = textLines(seg); if (!lines.length) return null;
-    const T2 = performance.now();
     if (sample) {
-      const pick = lines.slice().sort((a, b) => (b.x1 - b.x0) - (a.x1 - a.x0)).slice(0, sample);
-      const up = await nw.rec(pick.map(l => lineTensor(canvas, l, false))), dn = await nw.rec(pick.map(l => lineTensor(canvas, l, true)));
+      const up = await nw.rec(pr.up), dn = await nw.rec(pr.dn);
       const avg = r => r.confs.reduce((s, v, i) => s + v * r.texts[i].length, 0) / Math.max(1, r.texts.reduce((s, t) => s + t.length, 0));
       return { up: avg(up), down: avg(dn) };
     }
-    const groups = orderLines(lines, seg), flat = [];
-    for (const g of groups) for (const l of g.lines) flat.push(l);
-    const tens = flat.map(l => lineTensor(canvas, l, false)); const T3 = performance.now();
-    const r = await nw.rec(tens);
-    if (Q.get('debug')) console.log(`segment ${(T1 - T0) | 0}ms, textLines ${(T2 - T1) | 0}ms, order+crops ${(T3 - T2) | 0}ms, rec ${(performance.now() - T3) | 0}ms, 줄 ${flat.length}`);
+    const r = await nw.rec(pr.tensors);
+    if (Q.get('debug')) console.log(`글줄 찾기·자르기 ${(T1 - T0) | 0}ms, rec ${(performance.now() - T1) | 0}ms, 줄 ${r.texts.length}`);
     let k = 0, cs = 0, cn = 0, text = ''; const boxes = [];
-    for (const g of groups) { let first = true;
-      for (let i = 0; i < g.lines.length; i++, k++) { const t = r.texts[k], cf = r.confs[k], l = g.lines[i];
+    for (const g of pr.groups) { let first = true;
+      for (let i = 0; i < g.length; i++, k++) { const t = r.texts[k], cf = r.confs[k], l = g[i];
         if (Q.get('crops')) (window.__recs = window.__recs || []).push(cf.toFixed(2) + ' ' + t);
         if (!t || cf < 0.3) continue;        // 잡티를 글자로 읽은 것은 버림
         if (text) text += first ? '\n\n' : '\n';
@@ -611,31 +357,55 @@
         const yA = l.rTop + l.b * l.x0, yB = l.rTop + l.b * l.x1;
         boxes.push([text.length, text.length + t.length, l.x0, Math.min(yA, yB), l.x1, Math.max(yA, yB) + l.t]);
         text += t; cs += cf * t.length; cn += t.length; } }
-    return { text, boxes, W: canvas.width, H: canvas.height, conf: cn ? cs / cn : 0, chars: cn, table: seg.cells.length > 0 };
+    return { text, boxes, W: pr.W, H: pr.H, conf: cn ? cs / cn : 0, chars: cn, table: pr.table };
+  }
+  // 쪽 그림 다루개: 돌리기·글줄 읽기를 화면 쪽에서 하거나, 준비 작업자에게 맡김(그 쪽 그림은 작업자가 갖고 있음)
+  async function pageHandle(canvas, dpi, remote) {
+    if (remote) {
+      const pid = ++PREP.seq, r = await PREP.call('open2', canvas, { pid, dpi, prep: CFG.prep }), x = r.x;
+      return { vertical: r.vertical, W0: r.W0, H0: r.H0, turn: deg => PREP.send(x, { type: 'turn', pid, deg }),
+        read: sample => PREP.send(x, { type: 'read', pid, sample }).then(m => m.res), close: () => PREP.send(x, { type: 'close', pid }).catch(() => {}) };
+    }
+    if (CFG.prep) enhance(canvas);
+    let c = canvas;
+    return { vertical: linesAreVertical(c), W0: c.width, H0: c.height,
+      turn: async deg => { const n = rotated(c, deg); c.width = c.height = 0; c = n; },
+      read: async sample => IP.readLines(c, dpi, sample), close: () => { c.width = c.height = 0; } };
   }
 
   // 한 쪽을 신경망으로 읽음. 누웠거나 뒤집힌 쪽은 돌려서 읽음. 실패하면 null
-  async function nnPage(nw, page, dpi, knownDeg) {
-    const P0 = performance.now();
-    let canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
-    if (CFG.prep) enhance(canvas);
-    const P1 = performance.now(); let flipCheck = false;
-    const W0 = canvas.width, H0 = canvas.height; let rot = 0;
-    const turn = deg => { const c = rotated(canvas, deg); canvas.width = canvas.height = 0; canvas = c; rot = (rot + deg) % 360; };
-    let res;
-    if (linesAreVertical(canvas)) {
-      turn(90);
-      const sm = await nnRead(nw, canvas, dpi, 12);
-      if (sm && sm.down > sm.up) turn(180);
-      res = await nnRead(nw, canvas, dpi);
-    } else {
-      res = await nnRead(nw, canvas, dpi);
-      if (res && res.conf < 0.8 && res.chars >= 8) { flipCheck = true;       // 신뢰도가 낮으면 위아래가 뒤집혔는지 확인
-        const sm = await nnRead(nw, canvas, dpi, 12);
-        if (sm && sm.down > sm.up + 0.08) { turn(180); res = await nnRead(nw, canvas, dpi) || res; }
-      }
+  async function nnPage(nw, page, dpi) {
+    if (PREP.on) {
+      let prepErr = null;
+      try { return await nnPageWith(true, nw, page, dpi, e => { prepErr = e; }); }
+      catch (e) { if (!prepErr) throw e; prepFail(prepErr); }     // 준비 작업자 문제일 때만 화면 쪽에서 다시
     }
-    canvas.width = canvas.height = 0;
+    return nnPageWith(false, nw, page, dpi);
+  }
+  async function nnPageWith(remote, nw, page, dpi, onPrepErr) {
+    const P0 = performance.now();
+    const canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
+    const guard = p => remote ? p.catch(e => { onPrepErr(e); throw e; }) : p;
+    const h = await guard(pageHandle(canvas, dpi, remote));
+    const P1 = performance.now(); let flipCheck = false;
+    const W0 = h.W0, H0 = h.H0; let rot = 0;
+    const turn = async deg => { await guard(h.turn(deg)); rot = (rot + deg) % 360; };
+    const hr = { read: sample => guard(h.read(sample)) };
+    let res;
+    try {
+      if (h.vertical) {
+        await turn(90);
+        const sm = await nnRead(nw, hr, 12);
+        if (sm && sm.down > sm.up) await turn(180);
+        res = await nnRead(nw, hr);
+      } else {
+        res = await nnRead(nw, hr);
+        if (res && res.conf < 0.8 && res.chars >= 8) { flipCheck = true;       // 신뢰도가 낮으면 위아래가 뒤집혔는지 확인
+          const sm = await nnRead(nw, hr, 12);
+          if (sm && sm.down > sm.up + 0.08) { await turn(180); res = await nnRead(nw, hr) || res; }
+        }
+      }
+    } finally { h.close(); }
     if (res && res.boxes) {
       const back = (x, y) => { const Wr = res.W, Hr = res.H;      // 돌린 그림의 점 → 원래 쪽의 점
         return rot === 90 ? [y, Wr - x] : rot === 180 ? [Wr - x, Hr - y] : rot === 270 ? [Hr - y, x] : [x, y]; };
@@ -644,7 +414,7 @@
         return [s, e, +(Math.min(a[0], b[0]) / W0).toFixed(4), +(Math.min(a[1], b[1]) / H0).toFixed(4), +(Math.max(a[0], b[0]) / W0).toFixed(4), +(Math.max(a[1], b[1]) / H0).toFixed(4), rot];
       });
     }
-    if (Q.get('debug')) console.log(`nnPage render+enhance ${(P1 - P0) | 0}ms, 나머지 ${(performance.now() - P1) | 0}ms, 뒤집힘 확인 ${flipCheck}, conf ${res && res.conf.toFixed(2)}`);
+    if (Q.get('debug')) console.log(`nnPage 그리기${remote ? '·넘기기' : '·전처리'} ${(P1 - P0) | 0}ms, 나머지 ${(performance.now() - P1) | 0}ms, 뒤집힘 확인 ${flipCheck}, conf ${res && res.conf.toFixed(2)}`);
     return res && res.chars ? res : null;
   }
 

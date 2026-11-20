@@ -44,13 +44,14 @@ assets = {
  'a-ortgpumjs': gz64(rd(N+'onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.mjs')),
  'a-ortgpuwasm': gz64(rd(N+'onnxruntime-web/dist/ort-wasm-simd-threaded.asyncify.wasm')),
  'a-recworker': gz64(rd('src/recworker.js')),
+ 'a-prepworker': gz64(rd('src/prepworker.js')),
  'a-recmodel': gz64(rd(os.environ.get('REC_MODEL', 'models/rec_cpu.onnx'))),   # CPU용(8비트 행렬곱)
  'a-recgpu': gz64(rd('models/rec_gpu.onnx')),                                       # 그래픽카드용(실수 행렬곱)
  'a-recw': gz64(rd('models/rec_w.bin')),                                            # 두 모델이 함께 쓰는 가중치
  'a-recdict': gz64(rd('models/dict_small.txt')),
 }
 blocks = '\n'.join(f'<script type="application/octet-stream" id="{k}">{v}</script>' for k, v in assets.items())
-main = open('src/main.js', encoding='utf-8').read()
+main = open('src/imgproc.js', encoding='utf-8').read() + '\n' + open('src/main.js', encoding='utf-8').read()   # 그림 처리 함수는 화면 쪽과 준비 작업자가 함께 씀
 assert '</script' not in main
 s = head + '<!-- 내장 라이브러리: pdf.js 3.11.174 (Apache-2.0), tesseract.js 7.0.0 / tesseract.js-core (Apache-2.0), tessdata_fast kor (Apache-2.0), onnxruntime-web 1.31.1 (MIT), korean-handwriting-rec · PP-OCRv5 한국어 인식 모델 (Apache-2.0; 출력층을 상용 한글 2,350자·영문·기호로 줄이고 8비트로 경량화) -->\n' + blocks + '\n<script>\n' + main + '</script>\n</body>\n</html>\n'
 open(out, 'w', encoding='utf-8').write(s)
