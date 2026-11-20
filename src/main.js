@@ -370,7 +370,11 @@
   }
 
   // ---------- 신경망 인식 (PP-OCRv5 한국어) ----------
-  const NN = { ok: !!$('a-ort') && CFG.engine !== 'tess', pool: [], res: null, gpuInfo: null };
+  const NN = { ok: !!$('a-ort') && CFG.engine !== 'tess', pool: [], res: null };
+  const GPU = { state: CFG.gpu === '0' ? 'off' : 'idle', why: CFG.gpu === '0' ? '주소에 ?gpu=0 을 붙여 꺼 둠' : '', w: null, p: null, name: '', speed: 0 };
+  const gpuEl = document.createElement('div'); gpuEl.id = 'gpuNote';
+  gpuEl.style.cssText = 'font-size:.85rem;color:var(--muted);margin-top:4px';
+  statusEl.insertAdjacentElement('afterend', gpuEl);
   const nnRes = () => NN.res || (NN.res = (async () => { const T = performance.now(); const R = {
         url: URL.createObjectURL(new Blob([await asset('a-ort', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
         mjs: new TextDecoder().decode(await asset('a-ortmjs', true)),
@@ -399,7 +403,7 @@
       catch (e) { w.terminate(); throw e; }
       if (Q.get('debug')) console.log(ep + ' init ' + ((performance.now() - Ti) | 0) + 'ms' + (gpu ? `, 글줄 너비 1픽셀당 ${ready.msPerCol.toFixed(4)}ms` : ''));
       // 그래픽카드 작업자는 실패하면 같은 글줄을 CPU가 다시 읽어야 하므로 자료를 넘기지 않고 복사해서 보냄
-      return { gpu, msPerCol: ready.msPerCol, rec: lines => call({ type: 'rec', lines }, gpu ? [] : lines.map(l => l.data.buffer)), terminate: () => w.terminate() };
+      return { gpu, msPerCol: ready.msPerCol, name: ready.gpuName || '', rec: lines => call({ type: 'rec', lines }, gpu ? [] : lines.map(l => l.data.buffer)), terminate: () => w.terminate() };
     })();
   }
 
@@ -410,7 +414,8 @@
     const st = { cpuMs: 0, cpuN: 0, cpuCols: 0, gpuMs: 0, gpuN: 0, gpuCols: 0, gpuRuns: 0, gpuWhy: '' };
     // CPU 작업자 하나의 글줄 너비 1픽셀당 시간 (아직 잰 것이 없으면 4코어 시험 컴퓨터에서 잰 값)
     const cpuPerCol = () => st.cpuCols >= 4000 ? st.cpuMs / st.cpuCols : 0.26;
-    const retire = (w, why) => { const i = all.indexOf(w); if (i >= 0) all.splice(i, 1); size--; w.terminate(); st.gpuWhy = why; console.warn('그래픽카드 판독 중단:', why); };
+    const retire = (w, why) => { const i = all.indexOf(w); if (i >= 0) all.splice(i, 1); size--; w.terminate(); st.gpuWhy = why; console.warn('그래픽카드 판독 중단:', why);
+      if (w === GPU.w) { GPU.w = null; GPU.state = 'off'; GPU.why = why; gpuShow(); } };
     const pump = () => {
       while (idle.length && q.length) {
         const w = idle.pop(), jobs = [q.shift()];
@@ -436,12 +441,9 @@
       get size() { return size; },
       add(wp, optional) {
         size++;
-        wp.then(w => { if (closed) return w.terminate();
-            // 그래픽카드는 준비 때 잰 속도가 CPU 작업자 하나보다 느리면 쓰지 않음
-            if (w.gpu && CFG.gpu !== 'force' && w.msPerCol > cpuPerCol() * 0.8) { size--; w.terminate(); st.gpuWhy = `CPU보다 느림(${(w.msPerCol / cpuPerCol()).toFixed(1)}배)`; if (Q.get('debug')) console.log('그래픽카드 사용 안 함:', st.gpuWhy); return; }
-            all.push(w); idle.push(w); pump(); },
+        wp.then(w => { if (closed) { if (!w.keep) w.terminate(); return; } all.push(w); idle.push(w); pump(); },
           e => { size--; if (optional) { st.gpuWhy = String(e && e.message || e); if (Q.get('debug')) console.log('그래픽카드 사용 안 함:', st.gpuWhy); }
-            if (!size && !all.length) { failed = e; q.splice(0).forEach(j => j.no(e)); } });
+            else if (!size && !all.length) { failed = e; q.splice(0).forEach(j => j.no(e)); } });   // 그래픽카드 실패는 CPU 작업자에 영향 없음
       },
       async rec(lines) {
         if (failed) throw failed;
@@ -450,7 +452,7 @@
         const rs = await Promise.all(parts.map(l => new Promise((ok, no) => { q.push({ lines: l, ok, no }); pump(); })));
         return { texts: rs.flatMap(r => r.texts), confs: rs.flatMap(r => r.confs) };
       },
-      close() { closed = true; q.splice(0).forEach(j => j.no(new Error('중지됨'))); all.forEach(w => w.terminate()); }
+      close() { closed = true; q.splice(0).forEach(j => j.no(new Error('중지됨'))); all.forEach(w => { if (!w.keep) w.terminate(); }); }   // 그래픽카드 작업자는 다음 파일에도 씀
     };
   }
 
@@ -706,14 +708,15 @@
       const nWork = Math.min(CFG.workers, total);
       const nnOn = fine && NN.ok;
       const pool2 = nnOn ? nnPool(() => my === runId) : null;
+      // 그래픽카드는 CPU 작업자에 더해 하나. 준비돼 있으면 1차 판독 중에도 끝난 쪽부터 바로 읽음
+      if (pool2 && GPU.state !== 'off') pool2.add(gpuStart().then(w => w || Promise.reject(new Error(GPU.why))), true);
       const ready2 = [];                 // 1차가 끝나 2차를 기다리는 쪽
-      let gpuAdded = false, left1 = nWork, inflight = 0, t1 = 0, k2 = 0, done2 = 0, t2 = 0, wake = null;
+      let left1 = nWork, inflight = 0, t1 = 0, k2 = 0, done2 = 0, t2 = 0, wake = null;
       const poke = () => { if (wake) { const f = wake; wake = null; f(); } };
       const slotNN = [];
       NN.cancel = poke;                  // 중지하면 기다리던 2차 작업도 바로 끝냄
       const toNN = slot => {            // 이 작업자 자리를 Tesseract → 신경망으로 바꿈
         if (!pool2 || slotNN[slot]) return; slotNN[slot] = true;
-        if (!gpuAdded && CFG.gpu !== '0') { gpuAdded = true; pool2.add(nnWorker('webgpu'), true); }   // 그래픽카드는 CPU 작업자에 더해 하나
         if (pool[slot]) { pool[slot].then(w => w.terminate()).catch(() => {}); pool[slot] = null; }
         pool2.add(nnWorker()); poke();
       };
@@ -815,7 +818,7 @@
       setTimeout(prewarm, 1500);        // 다음 파일을 위해 1차 엔진을 미리 준비
       let gpuNote = '';
       if (pool2 && pool2.st.gpuN) gpuNote = ` · 그래픽카드가 글줄 ${Math.round(pool2.st.gpuN / (pool2.st.gpuN + pool2.st.cpuN) * 100)}% 판독`;
-      else if (pool2 && pool2.st.gpuWhy && Q.get('debug')) gpuNote = ` · 그래픽카드 안 씀(${pool2.st.gpuWhy})`;
+      else if (pool2 && ocrCount) gpuNote = ` · 그래픽카드 안 씀(${GPU.state === 'loading' ? '준비가 끝나기 전에 분석이 끝남' : GPU.why || pool2.st.gpuWhy || '쓸 일이 없었음'})`;
       setStatus(`분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}${gpuNote}`, 'ok');
       search();
     } catch (e) {
@@ -986,12 +989,34 @@
     analyze(file);
   }
 
+  // ---------- 그래픽카드 ----------
+  // 페이지를 열면 바로 준비하고 속도를 재어 둠. 한 번 준비되면 다음 파일에도 계속 씀
+  function gpuShow() {
+    gpuEl.textContent = '그래픽카드: ' + ({ idle: '확인 전', loading: '준비 중… (처음 한 번 수십 초 걸릴 수 있음)',
+      ready: `사용함 — ${GPU.name || '이름 모름'}, 글줄 읽기가 CPU 한 코어보다 약 ${GPU.speed}배 빠름`, off: `안 씀 — ${GPU.why}` })[GPU.state];
+  }
+  function gpuStart() {
+    if (GPU.p) return GPU.p;
+    if (GPU.state === 'off' || !NN.ok) return Promise.resolve(null);
+    GPU.state = 'loading'; gpuShow(); let late = false;
+    const wp = nnWorker('webgpu');
+    const timeout = new Promise((_, no) => setTimeout(() => { late = true; no(new Error('준비 시간 초과(2분)')); }, 120000));
+    wp.then(w => { if (late) w.terminate(); }, () => {});
+    GPU.p = Promise.race([wp, timeout]).then(w => {
+      const x = 0.26 / w.msPerCol;      // 0.26: 4코어 시험 컴퓨터에서 CPU 한 코어의 글줄 너비 1픽셀당 시간(ms)
+      if (CFG.gpu !== 'force' && x < 1.25) { w.terminate(); throw new Error(`CPU 한 코어보다 빠르지 않음(${x.toFixed(1)}배${w.name ? ', ' + w.name : ''})`); }
+      w.keep = true; GPU.w = w; GPU.name = w.name; GPU.speed = x >= 10 ? Math.round(x) : x.toFixed(1); GPU.state = 'ready'; gpuShow(); return w;
+    }).catch(e => { GPU.state = 'off'; GPU.why = String(e && e.message || e); gpuShow(); return null; });
+    return GPU.p;
+  }
+
   // 파일을 고르기 전에 엔진을 미리 준비해 두어 분석 시작이 빨라지게 함
   function prewarm() {
     if (running || pool.some(Boolean) || !CFG.warm) return;
     poolLang = 'kor';
     pool = Array.from({ length: CFG.workers }, (_, i) => { const p = makeWorker('kor'); p.catch(() => { if (pool[i] === p) pool[i] = null; }); return p; });
     if (NN.ok) nnRes().catch(() => {});
+    if (NN.ok && CFG.warm && $('fine').checked) gpuStart();
   }
 
   drop.onclick = () => fileInput.click();
@@ -1013,5 +1038,6 @@
   qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); } };
   $('pvClose').onclick = () => $('dlg').close();
   if (early) { pick(early); early = null; }
+  gpuShow();
   setTimeout(prewarm, 0);              // 화면 동작을 다 연결한 뒤에 준비 시작
 })();

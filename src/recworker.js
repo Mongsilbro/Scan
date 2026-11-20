@@ -1,11 +1,13 @@
 // 글자 인식 작업자: onnxruntime-web + PP-OCRv5 한국어 인식 모델. 모든 자원은 메시지로 전달받아 네트워크를 쓰지 않음
 // ep = 'wasm'(CPU) 또는 'webgpu'(그래픽카드)
 let session = null, chars = null, gpu = false;
+let gpuName = '';
 async function hasRealGpu(force) {
   if (!self.navigator || !navigator.gpu) return '이 브라우저는 WebGPU를 지원하지 않음';
   const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-  if (!a) return '그래픽카드를 찾지 못함';
-  if (!force && (a.isFallbackAdapter || (a.info && a.info.isFallbackAdapter))) return '소프트웨어 그래픽(실제 그래픽카드 아님)';
+  if (!a) return '브라우저가 그래픽카드를 찾지 못함';
+  const i = a.info || {}; gpuName = [i.vendor, i.architecture, i.description].filter(Boolean).join(' ');
+  if (!force && (a.isFallbackAdapter || i.isFallbackAdapter)) return '소프트웨어 그래픽(실제 그래픽카드 아님)';
   return '';
 }
 // 출력 하나(T × C)에서 앞쪽 T0칸만 풀어 글자로
@@ -39,7 +41,7 @@ self.onmessage = async e => {
         for (let k = 0; k < 3; k++) await session.run({ [session.inputNames[0]]: x() });
         msPerCol = (performance.now() - t) / (3 * 512);
       }
-      self.postMessage({ type: 'ready', id: m.id, msPerCol });
+      self.postMessage({ type: 'ready', id: m.id, msPerCol, gpuName });
     } else if (m.type === 'rec') {
       // 한 줄씩 원래 너비 그대로 읽음 (오른쪽을 채워 여러 줄을 묶으면 모델이 줄 전체를 보므로 결과가 조금 달라짐)
       const texts = [], confs = [], inName = session.inputNames[0], outName = session.outputNames[0];
