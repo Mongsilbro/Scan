@@ -88,6 +88,28 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
   check(/===== 2쪽 =====/.test(txt) && txt.length > 100, `인식된 글자 저장 (${txt.length}자)`);
   check(/분석 완료/.test(await t.title()), `탭 제목: ${await t.title()}`);
 
+  console.log('고른 쪽 새 PDF로 저장');
+  {
+    const { PDFDocument } = require('pdf-lib'), { unzipSync } = require('fflate'), fs = require('fs');
+    await t.fill('#q', '계약'); await t.waitForTimeout(400);
+    await t.click('#saveRes'); await t.waitForTimeout(200);
+    const pre = await t.inputValue('#svPages');
+    check(/^1-2$/.test(pre) || /1/.test(pre), `찾은 쪽이 미리 채워짐: "${pre}" (${await t.$eval('#svFile', e => e.selectedOptions[0].textContent)})`);
+    await t.selectOption('#svFile', { label: 'scan.pdf (3쪽)' });
+    await t.fill('#svPages', '1-2, 3'); await t.check('#svOne');
+    let [dl] = await Promise.all([t.waitForEvent('download'), t.click('#svGo')]);
+    const one = await PDFDocument.load(fs.readFileSync(await dl.path()));
+    check(one.getPageCount() === 3, `한 PDF로: ${one.getPageCount()}쪽`);
+    await t.fill('#svPages', '1-2, 3'); await t.check('#svSplit'); await t.waitForTimeout(1600);
+    [dl] = await Promise.all([t.waitForEvent('download'), t.click('#svGo')]);
+    const zip = unzipSync(fs.readFileSync(await dl.path())), names = Object.keys(zip);
+    const counts = await Promise.all(names.map(async n => (await PDFDocument.load(zip[n])).getPageCount()));
+    check(names.length === 2 && counts.join() === '2,1', `구역마다 따로(ZIP): ${names.join(' / ')} → ${counts.join(', ')}쪽`);
+    await t.fill('#svPages', '0, 9'); await t.waitForTimeout(100);
+    check(await t.$eval('#svGo', e => e.disabled) && /알아볼 수 없는/.test(await t.textContent('#svNote')), '잘못 적은 쪽은 알려 주고 저장 안 함');
+    await t.click('#svClose');
+  }
+
   console.log('네트워크');
   check(net === 0, `외부 접속 시도 ${net}건`);
   await b.close();

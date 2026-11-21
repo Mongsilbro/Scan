@@ -8,7 +8,9 @@
     "bench": "node tests/bench.js dist/pdf-page-finder.html"
   },
   "dependencies": {
+    "fflate": "0.8.3",
     "onnxruntime-web": "1.31.1",
+    "pdf-lib": "1.17.1",
     "pdfjs-dist": "3.11.174",
     "tesseract.js": "7.0.0",
     "tesseract.js-core": "7.0.0"

@@ -459,7 +459,7 @@
     curFile = file; pages = []; total = 0; pdf = null; running = true;
     curDoc = docs.find(d => d.file === file);
     if (!curDoc) { curDoc = { file, name: file.name }; docs.push(curDoc); }
-    Object.assign(curDoc, { pages, total: 0, pdf: null, state: 'run', note: '' });
+    Object.assign(curDoc, { pages, total: 0, pdf: null, state: 'run', note: '', p2: '' });
     const me = curDoc; renderDocs();
     bar.classList.remove('hidden'); bar.value = 0; $('stop').classList.remove('hidden');
     setStatus('PDF를 여는 중…'); search();
@@ -507,7 +507,8 @@
       const status2 = () => {
         let left = '';
         if (done2 >= 2) left = ' · ' + fmtLeft((performance.now() - t2) / 1000 / done2 * (ocrPages.length - done2));
-        setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
+        me.p2 = `${done2}/${ocrPages.length}`;
+        setStatus(`${docPrefix(me)}1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
       };
       const loop1 = async slot => {
         while (my === runId) {
@@ -549,7 +550,7 @@
           done++; if (!t1) bar.value = done;
           let left = '';
           if (ocrCount >= 2) left = ' · 1차 ' + fmtLeft((performance.now() - ocrStart) / 1000 / ocrCount * (total - done));
-          if (!t1) setStatus(`1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
+          if (!t1) setStatus(`${docPrefix(me)}1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
           searchSoon();
         }
         if (my !== runId) return;
@@ -640,9 +641,11 @@
       const nm = document.createElement('span'); nm.className = 'doc-name'; nm.textContent = d.name;
       const st = document.createElement('small');
       const n = (d.pages || []).filter(Boolean).length;
-      st.textContent = label[d.state] + (d.state === 'run' && d.total ? ` ${n}/${d.total}쪽` : d.total ? ` · ${d.total}쪽` : '') + (d.note && d.state !== 'err' ? ` · ${d.note}` : '');
+      const prog = d.p2 ? `정밀 판독 ${d.p2}쪽` : `1차 판독 ${n}/${d.total}쪽`;
+      st.textContent = (d.state === 'run' && d.total ? prog : label[d.state] + (d.total ? ` · ${d.total}쪽` : '')) + (d.note && d.state !== 'err' ? ` · ${d.note}` : '');
       if (d.state === 'err') st.className = 'err';
       row.append(nm, st);
+      if (d.pdf) { const pg = document.createElement('button'); pg.textContent = '쪽 저장'; pg.title = '고른 쪽만 새 PDF로 저장'; pg.onclick = () => openSave(d); row.append(pg); }
       if (n) { const sv = document.createElement('button'); sv.textContent = '글자 저장'; sv.title = '인식된 글자를 텍스트 파일로 저장'; sv.onclick = () => saveText(d); row.append(sv); }
       const rm = document.createElement('button'); rm.textContent = '×'; rm.title = '목록에서 빼기'; rm.setAttribute('aria-label', d.name + ' 목록에서 빼기');
       rm.onclick = () => removeDoc(d); row.append(rm);
@@ -660,9 +663,76 @@
   // 인식된 글자를 쪽 표시와 함께 텍스트 파일로 (신경망 결과가 있으면 그것, 없으면 1차 결과)
   function saveText(d) {
     const body = d.pages.filter(Boolean).map(p => `===== ${p.n}쪽 =====\n${p.layers[0].text.trim()}`).join('\n\n');
-    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob(['\ufeff' + body], { type: 'text/plain;charset=utf-8' }));
-    a.download = d.name.replace(/\.pdf$/i, '') + ' - 인식된 글자.txt'; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    download(new Blob(['\ufeff' + body], { type: 'text/plain;charset=utf-8' }), d.name.replace(/\.pdf$/i, '') + ' - 인식된 글자.txt');
+  }
+  function download(blob, name) {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name.replace(/[\\/:*?"<>|]/g, '_');
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  // ---------- 고른 쪽을 새 PDF로 저장 ----------
+  // 쪽 적기: "2, 5-7, 10~12" — 쉼표로 나눈 묶음 하나가 '구역'. 구역마다 따로 저장하면 ZIP 하나로 묶어 내려받음
+  let libsP = null;
+  const pdfLibs = () => libsP || (libsP = (async () => { await loadScript('a-pdflib'); await loadScript('a-fflate'); })());
+  function parseRanges(str, total) {
+    const groups = [], bad = [];
+    for (const part of str.split(/[,，;\n]+/).map(x => x.trim()).filter(Boolean)) {
+      const m = part.match(/^(\d+)\s*(?:[-~–]\s*(\d+))?\s*쪽?$/);
+      if (!m) { bad.push(part); continue; }
+      let a = +m[1], b = m[2] ? +m[2] : a; if (a > b) [a, b] = [b, a];
+      if (a < 1 || b > total) { bad.push(part); continue; }
+      const g = []; for (let n = a; n <= b; n++) g.push(n); groups.push(g);
+    }
+    return { groups, bad };
+  }
+  // 쪽 번호들 → "2, 5-7"
+  function compress(ns) {
+    ns = [...new Set(ns)].sort((a, b) => a - b); const out = [];
+    for (let i = 0; i < ns.length; i++) { let j = i; while (j + 1 < ns.length && ns[j + 1] === ns[j] + 1) j++; out.push(i === j ? '' + ns[i] : ns[i] + '-' + ns[j]); i = j; }
+    return out.join(', ');
+  }
+  const hitPages = d => nav.filter(x => x.d === d).map(x => x.n);
+  function openSave(d, pagesText) {
+    const ds = docs.filter(x => x.pdf);
+    if (!ds.length) return;
+    if (!d || !d.pdf) d = ds.find(x => hitPages(x).length) || ds[0];
+    const sel = $('svFile'); sel.innerHTML = '';
+    ds.forEach((x, i) => { const o = document.createElement('option'); o.value = i; o.textContent = `${x.name} (${x.total}쪽)`; if (x === d) o.selected = true; sel.appendChild(o); });
+    const fill = x => { $('svPages').value = compress(hitPages(x)); svCheck(); };
+    sel.onchange = () => fill(ds[+sel.value]);
+    $('svPages').value = pagesText !== undefined ? pagesText : compress(hitPages(d));
+    $('saveDlg').__ds = ds; svCheck(); $('saveDlg').showModal(); $('svPages').focus();
+  }
+  function svCheck() {
+    const dlg = $('saveDlg'), d = dlg.__ds[+$('svFile').value], { groups, bad } = parseRanges($('svPages').value, d.total);
+    const n = new Set(groups.flat()).size, split = $('svSplit').checked;
+    $('svNote').textContent = bad.length ? `알아볼 수 없는 부분: ${bad.join(', ')} (1~${d.total}쪽 사이로 적어 주세요)`
+      : !n ? '저장할 쪽을 적어 주세요. 예: 2, 5-7, 12'
+      : `${n}쪽` + (split && groups.length > 1 ? ` · 구역 ${groups.length}개를 따로 PDF로 만들어 ZIP 하나로 저장` : ' · PDF 한 개로 저장');
+    $('svNote').className = bad.length ? 'err' : '';
+    $('svGo').disabled = !!bad.length || !n;
+  }
+  async function savePages() {
+    const dlg = $('saveDlg'), d = dlg.__ds[+$('svFile').value], { groups } = parseRanges($('svPages').value, d.total), split = $('svSplit').checked;
+    const go = $('svGo'); go.disabled = true; go.textContent = '만드는 중…';
+    try {
+      await pdfLibs();
+      const src = await PDFLib.PDFDocument.load(await d.file.arrayBuffer(), { ignoreEncryption: true });
+      const make = async ns => { const out = await PDFLib.PDFDocument.create(); for (const pg of await out.copyPages(src, ns.map(n => n - 1))) out.addPage(pg); return out.save(); };
+      const base = d.name.replace(/\.pdf$/i, '');
+      if (split && groups.length > 1) {
+        const files = {};
+        for (const g of groups) files[`${base} ${compress(g)}쪽.pdf`] = await make(g);
+        download(new Blob([fflate.zipSync(files, { level: 0 })], { type: 'application/zip' }), `${base} 구역 ${groups.length}개.zip`);
+      } else {
+        const all = groups.flat(), ns = split ? all : [...new Set(all)];
+        download(new Blob([await make(ns)], { type: 'application/pdf' }), `${base} ${compress(ns)}쪽.pdf`);
+      }
+      go.textContent = '저장했습니다'; setTimeout(() => { go.textContent = '저장'; svCheck(); }, 1500);
+    } catch (e) {
+      console.error(e); go.textContent = '저장'; go.disabled = false;
+      $('svNote').textContent = '저장하지 못했습니다: ' + (/encrypt/i.test(e && e.message) ? '암호가 걸린 PDF입니다' : (e && e.message || e)); $('svNote').className = 'err';
+    }
   }
 
   // ---------- 검색 ----------
@@ -729,7 +799,7 @@
     if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }   // 지금 찾으므로 미뤄 둔 검색은 취소
     renderDocs();
     const raw = qEl.value.trim(), terms = raw.split(/(?<!\d)[,，]|[,，](?!\d)/).map(t => t.trim()).filter(t => normalize(t).out);
-    hitsEl.innerHTML = ''; chipsEl.innerHTML = ''; nav = []; lastCopy = ''; $('copyRes').classList.add('hidden');
+    hitsEl.innerHTML = ''; chipsEl.innerHTML = ''; nav = []; lastCopy = ''; $('copyRes').classList.add('hidden'); $('saveRes').classList.add('hidden');
     const ds = docs.filter(d => d.pages && d.pages.some(Boolean));
     if (!ds.length || !terms.length) { summaryEl.textContent = ''; return; }
     const multiDoc = ds.length > 1, done = ds.reduce((s, d) => s + d.pages.filter(Boolean).length, 0), all = ds.reduce((s, d) => s + d.total, 0);
@@ -785,7 +855,7 @@
       if (totFz) parts.push(`비슷한 표현 ${totFz}개 페이지`);
       summaryEl.textContent = `${where}"${terms[0]}" — ${parts.join(', ')}${partial}`;
     }
-    lastCopy = copy.join('\n'); $('copyRes').classList.remove('hidden');
+    lastCopy = copy.join('\n'); $('copyRes').classList.remove('hidden'); $('saveRes').classList.remove('hidden');
   }
   function chipFor(d, n, t, fuzzy) {
     const chip = document.createElement('button');
@@ -843,10 +913,10 @@
     return [];
   }
 
-  let pvSeq = 0;
+  let pvSeq = 0, pvCur = null;
   async function preview(d, n, raw, idx) {
     if (!d.pdf) return;
-    const my = ++pvSeq, pages = d.pages; navI = idx === undefined ? -1 : idx;
+    const my = ++pvSeq, pages = d.pages; navI = idx === undefined ? -1 : idx; pvCur = { d, n };
     $('pvTitle').textContent = (docs.length > 1 ? d.name + ' · ' : '') + `${n}쪽 / 전체 ${d.total}쪽`;
     $('pvPrev').disabled = navI <= 0; $('pvNext').disabled = navI < 0 || navI >= nav.length - 1;
     $('pvPos').textContent = navI >= 0 ? `결과 ${navI + 1}/${nav.length}` : '';
@@ -942,6 +1012,11 @@
   $('pvClose').onclick = () => $('dlg').close();
   const go = k => { const x = nav[navI + k]; if (x) preview(x.d, x.n, x.t, navI + k); };
   $('pvPrev').onclick = () => go(-1); $('pvNext').onclick = () => go(1);
+  $('pvSave').onclick = () => { if (pvCur) { $('dlg').close(); openSave(pvCur.d, String(pvCur.n)); } };
+  $('saveRes').onclick = () => openSave(null);
+  $('svPages').oninput = svCheck; $('svFile').onchange = svCheck; $('svSplit').onchange = $('svOne').onchange = svCheck;
+  $('svGo').onclick = savePages; $('svClose').onclick = () => $('saveDlg').close();
+  $('svPages').onkeydown = e => { if (e.key === 'Enter' && !$('svGo').disabled) savePages(); };
   $('dlg').addEventListener('keydown', e => { if (e.key === 'ArrowLeft') { e.preventDefault(); go(-1); } else if (e.key === 'ArrowRight') { e.preventDefault(); go(1); } });
   $('copyRes').onclick = async () => {
     try { await navigator.clipboard.writeText(lastCopy); }
