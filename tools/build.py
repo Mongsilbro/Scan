@@ -14,7 +14,7 @@ head = rep('<label><input type="checkbox" id="force"> 글자 정보가 있어도
  '<label><input type="checkbox" id="force"> 글자 정보가 있어도 항상 OCR 사용</label>\n      <label><input type="checkbox" id="fine"> 정밀 인식 (2배쯤 느리지만 작은 글씨·흐린 스캔에 강함)</label>', head)
 i = head.index('      <label>문서 언어'); j = head.index('</label>', head.index('</select>', i)) + len('</label>\n')
 head = head[:i] + head[j:]
-head = rep('<label><input type="checkbox" id="fine"> 정밀 인식 (2배쯤 느리지만 작은 글씨·흐린 스캔에 강함)</label>', '<label><input type="checkbox" id="fine" checked> 정밀 판독 (1차 판독 뒤 신경망 엔진으로 한 번 더 읽음. 끄면 2배쯤 빠르지만 덜 정확)</label>', head)
+head = rep('<label><input type="checkbox" id="fine"> 정밀 인식 (2배쯤 느리지만 작은 글씨·흐린 스캔에 강함)</label>', '<label><input type="checkbox" id="fine" checked> 정밀 판독 (1차 판독 뒤 신경망 엔진으로 한 번 더 읽음. 끄면 약 3배 빠르지만 영어·숫자·흐린 글자를 많이 놓침 — 켜 두기를 권함)</label>', head)
 head = rep('<progress id="bar"', '<div class="row" style="color:var(--muted);font-size:.85rem;margin-top:6px">한 번 분석한 파일은 이 브라우저에 결과가 저장되어, 다시 열면 바로 검색됩니다. <button id="clearCache" style="font-size:.85rem;padding:3px 10px">저장된 결과 지우기</button></div>\n    <progress id="bar"', head)
 head = rep('<canvas id="pv"></canvas>', '<div id="pvNote" style="font-size:.9rem;color:var(--muted);margin:0 0 8px"></div></div><canvas id="pv"></canvas>', head)
 head = rep('<div class="dlg-head">', '<div class="dlg-top"><div class="dlg-head">', head)
