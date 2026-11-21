@@ -42,6 +42,13 @@ async function run(label, args, query) {
   check(/노란 상자/.test(await t.textContent('#pvNote')), '미리보기·위치 표시');
   await t.keyboard.press('ArrowRight'); await t.waitForTimeout(1200);
   check(/결과 2\//.test(await t.textContent('#pvPos')), '미리보기 다음 결과');
+  await t.keyboard.press('ArrowLeft'); await t.waitForTimeout(1200);       // 쪽이 여럿인 scan.pdf 결과로 돌아감
+  const t0 = await t.textContent('#pvTitle'); await t.keyboard.press(/ 1쪽/.test(t0) ? 'PageDown' : 'PageUp'); await t.waitForTimeout(1200);
+  const t1 = await t.textContent('#pvTitle');
+  check(t0 !== t1 && /\d+쪽/.test(t1), `미리보기 쪽 넘기기: ${t0} → ${t1}`);
+  await t.keyboard.press('+'); await t.waitForTimeout(200);
+  check(/150%/.test(await t.textContent('#pvZoom')) && await t.$eval('#pv', e => e.clientWidth > e.parentElement.clientWidth), '미리보기 확대: ' + await t.textContent('#pvZoom'));
+  await t.keyboard.press('0'); await t.keyboard.press('PageDown'); await t.waitForTimeout(1000);
   await t.click('#pvSave'); await t.waitForTimeout(300);
   let [dl] = await Promise.all([t.waitForEvent('download'), t.click('#svGo')]);
   check(fs.readFileSync(await dl.path()).slice(0, 5).toString() === '%PDF-', '이 쪽 새 PDF로 저장 (pdf-lib)');
@@ -51,6 +58,15 @@ async function run(label, args, query) {
   await t.click('#svClose');
   [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc button:text("글자 저장")')]);
   check(/=====/.test(fs.readFileSync(await dl.path(), 'utf8')), '인식된 글자 저장');
+  [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc-all button')]);
+  const { unzipSync } = require('fflate');
+  check(Object.keys(unzipSync(fs.readFileSync(await dl.path()))).length === 3, '모든 파일 글자 한꺼번에 저장(ZIP)');
+  await t.fill('#q', '계약기간, 보증금'); await t.waitForTimeout(400);
+  [dl] = await Promise.all([t.waitForEvent('download'), t.click('#csvRes')]);
+  const csv = fs.readFileSync(await dl.path(), 'utf8');
+  check(/^\ufeff찾은 말,파일,쪽/.test(csv) && csv.split('\r\n').length >= 3, `검색 결과 엑셀(CSV) 저장: ${csv.split('\r\n').length - 1}줄`);
+  await t.press('#q', 'Enter'); await t.waitForTimeout(200);
+  check(await t.$eval('#recentQ', e => [...e.options].some(o => o.value === '계약기간, 보증금')), '최근 검색어 기억');
 
   // 다시 열기(브라우저에 저장된 결과)도 오프라인에서
   await t.goto(html + '?r=1' + query); await t.click('#clearCache');
