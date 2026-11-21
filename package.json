@@ -5,7 +5,8 @@
   "scripts": {
     "build": "python3 tools/build.py",
     "test": "node tests/regress.js dist/pdf-page-finder.html",
-    "bench": "node tests/bench.js dist/pdf-page-finder.html"
+    "bench": "node tests/bench.js dist/pdf-page-finder.html",
+    "offline": "node tests/offline.js dist/pdf-page-finder.html"
   },
   "dependencies": {
     "fflate": "0.8.3",
