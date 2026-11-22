@@ -909,18 +909,30 @@
     return found;
   }
   // 검색: 쉼표(,)로 나누면 여러 낱말을 따로 찾고, 모두 들어 있는 쪽도 보여줌. 파일이 여럿이면 파일별로
-  let nav = [], navI = -1, lastCopy = '', lastRows = [];
+  let nav = [], navI = -1, lastCopy = '', lastRows = [], curTerms = [];
   function search() {
     lastSearch = performance.now();
     if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }   // 지금 찾으므로 미뤄 둔 검색은 취소
     renderDocs();
-    const raw = qEl.value.trim(), terms = raw.split(/(?<!\d)[,，]|[,，](?!\d)/).map(t => t.trim()).filter(t => normalize(t).out);
+    const raw = qEl.value.trim();
+    const parsed = raw.split(/(?<!\d)[,，]|[,，](?!\d)/).map(x => {
+      let t = x.trim(), neg = false, exact = false;
+      if (/^[-－](?![\d-])/.test(t)) { neg = true; t = t.slice(1).trim(); }        // -낱말 (단, -33- 같은 숫자는 그대로 찾음)
+      const m = t.match(/^["“”'‘’](.+)["“”'‘’]$/); if (m) { exact = true; t = m[1].trim(); }
+      return { t, neg, exact };
+    }).filter(x => normalize(x.t).out);
+    const pos = parsed.filter(x => !x.neg), negs = parsed.filter(x => x.neg), terms = pos.map(x => x.t);
+    curTerms = terms;
     hitsEl.innerHTML = ''; chipsEl.innerHTML = ''; nav = []; lastCopy = ''; lastRows = []; $('copyRes').classList.add('hidden'); $('saveRes').classList.add('hidden'); $('csvRes').classList.add('hidden');
     const ds = docs.filter(d => d.pages && d.pages.some(Boolean));
-    if (!ds.length || !terms.length) { summaryEl.textContent = ''; return; }
+    if (!ds.length || !parsed.length) { summaryEl.textContent = ''; return; }
+    if (!terms.length) { summaryEl.textContent = '빼는 말(-낱말)만 있습니다. 찾을 말도 함께 적어 주세요.'; return; }
     const multiDoc = ds.length > 1, done = ds.reduce((s, d) => s + d.pages.filter(Boolean).length, 0), all = ds.reduce((s, d) => s + d.total, 0);
     const partial = !running && !queue.length ? '' : done >= all && !queue.length ? ' (정밀 판독 중이라 결과가 더 나올 수 있습니다)' : ` (지금까지 분석한 ${done}쪽 기준)`;
-    const res = terms.map(t => ({ t, per: ds.map(d => ({ d, found: findIn(d, t) })) }));
+    // 빼는 말이 (정확히) 있는 쪽
+    const excl = new Map(ds.map(d => [d, new Set(negs.flatMap(x => findIn(d, x.t, 0).map(f => f.p.n)))]));
+    const res = pos.map(x => ({ t: x.t, per: ds.map(d => ({ d, found: findIn(d, x.t, x.exact ? 0 : undefined).filter(f => !excl.get(d).has(f.p.n)) })) }));
+    const exclNote = negs.length ? ` · "${negs.map(x => x.t).join('", "')}" 이(가) 있는 쪽 ${[...excl.values()].reduce((s, v) => s + v.size, 0)}개 뺌` : '';
     const copy = [];
     // 여러 낱말: 모두 들어 있는 쪽
     if (terms.length > 1) {
@@ -965,15 +977,15 @@
     }
     const where = multiDoc ? `파일 ${ds.length}개 · ` : '';
     if (!totPages && !totFz) {
-      summaryEl.textContent = `${where}"${terms.join('", "')}" 을(를) 찾지 못했습니다${partial}.` + (running ? '' : ' 스캔 상태가 흐리면 인식이 틀릴 수 있으니 더 짧은 단어로도 찾아보세요.');
+      summaryEl.textContent = `${where}"${terms.join('", "')}" 을(를) 찾지 못했습니다${exclNote}${partial}.` + (running ? '' : ' 스캔 상태가 흐리면 인식이 틀릴 수 있으니 더 짧은 단어로도 찾아보세요.');
       return;
     }
-    if (terms.length > 1) summaryEl.textContent = `${where}낱말 ${terms.length}개를 따로 찾았습니다${partial}`;
+    if (terms.length > 1) summaryEl.textContent = `${where}낱말 ${terms.length}개를 따로 찾았습니다${exclNote}${partial}`;
     else {
       const parts = [];
       if (totPages) parts.push(`${totPages}개 페이지에서 ${totHits}건 발견`);
       if (totFz) parts.push(`비슷한 표현 ${totFz}개 페이지`);
-      summaryEl.textContent = `${where}"${terms[0]}" — ${parts.join(', ')}${partial}`;
+      summaryEl.textContent = `${where}"${terms[0]}" — ${parts.join(', ')}${exclNote}${partial}`;
     }
     lastCopy = copy.join('\n'); $('copyRes').classList.remove('hidden'); $('saveRes').classList.remove('hidden'); $('csvRes').classList.remove('hidden');
   }
@@ -1052,18 +1064,26 @@
     if (my !== pvSeq) { c.width = c.height = 0; return; }      // 그사이 다른 결과로 넘김
     const pv = $('pv'); pv.width = c.width; pv.height = c.height; applyZoom();
     const ctx = pv.getContext('2d'); ctx.drawImage(c, 0, 0); c.width = c.height = 0;
-    const rs = raw && pages[n - 1] ? locate(pages[n - 1], raw) : [];
-    if (rs.length) {
+    // 찾은 말이 여럿이면 말마다 다른 색 (누른 말을 맨 앞에)
+    const ts = raw ? [raw].concat(curTerms.filter(t => t !== raw)) : [];
+    const COLORS = [['255,214,0', '230,120,0', '노란'], ['80,160,255', '20,90,200', '파란'], ['90,200,120', '20,130,60', '초록'], ['255,120,190', '200,30,120', '분홍'], ['180,140,255', '110,60,200', '보라']];
+    const marks = ts.map((t, i) => ({ t, c: COLORS[i % COLORS.length], rs: pages[n - 1] ? locate(pages[n - 1], t) : [] }));
+    const rs = marks[0] ? marks[0].rs : [];
+    if (marks.some(m => m.rs.length)) {
       const W = pv.width, H = pv.height, pad = 4;
-      ctx.save(); ctx.fillStyle = 'rgba(255, 214, 0, 0.35)'; ctx.strokeStyle = 'rgba(230, 120, 0, 0.95)'; ctx.lineWidth = 3;
-      for (const [x0, y0, x1, y1] of rs) { const x = x0 * W - pad, y = y0 * H - pad, w = (x1 - x0) * W + 2 * pad, h = (y1 - y0) * H + 2 * pad; ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h); }
-      ctx.restore();
-      $('pvNote').textContent = `노란 상자: "${raw}" 위치 ${rs.length}곳 (글자 인식 결과 기준이라 조금 어긋날 수 있습니다)`;
-      const top = Math.min(...rs.map(r => r[1]));
+      for (const m of marks.slice().reverse()) {
+        ctx.save(); ctx.fillStyle = `rgba(${m.c[0]}, 0.35)`; ctx.strokeStyle = `rgba(${m.c[1]}, 0.95)`; ctx.lineWidth = 3;
+        for (const [x0, y0, x1, y1] of m.rs) { const x = x0 * W - pad, y = y0 * H - pad, w = (x1 - x0) * W + 2 * pad, h = (y1 - y0) * H + 2 * pad; ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h); }
+        ctx.restore();
+      }
+      const shown = marks.filter(m => m.rs.length);
+      $('pvNote').innerHTML = shown.map(m => `<span class="swatch" style="background:rgba(${m.c[0]},.5);border-color:rgb(${m.c[1]})"></span>${m.c[2]} 상자: "${esc(m.t)}" ${m.rs.length}곳`).join(' · ') +
+        ' <span class="muted">(글자 인식 결과 기준이라 조금 어긋날 수 있습니다)</span>';
+      const top = Math.min(...(rs.length ? rs : shown[0].rs).map(r => r[1]));
       requestAnimationFrame(() => { const y = pv.offsetTop + top * pv.clientHeight - dlg.clientHeight / 3; dlg.scrollTop = Math.max(0, y); });
     } else if (raw && pages[n - 1] && findIn(d, raw, 0).concat(findIn(d, raw)).some(f => f.p.n === n)) $('pvNote').textContent = '이 쪽에서 정확한 위치는 표시하지 못했습니다. 쪽 전체에서 찾아보세요.';
     else if (raw) $('pvNote').textContent = `이 쪽에는 "${raw}" 이(가) 없습니다.`;
-    if (!rs.length) dlg.scrollTop = 0;
+    if (!marks.some(m => m.rs.length)) dlg.scrollTop = 0;
   }
   // 확대: 1 = 창 너비에 맞춤
   let zoom = 1;

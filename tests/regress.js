@@ -110,6 +110,23 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
     await t.click('#svClose');
   }
 
+  console.log('검색 기호·여러 색');
+  {
+    await t.goto(html + '?nocache=1'); await t.setInputFiles('#file', path.join(FX, 'scan.pdf'));
+    await t.waitForFunction(() => /분석 완료|오류/.test(document.getElementById('status').textContent), null, { timeout: 300000 });
+    const chips = async q => { await t.fill('#q', q); await t.waitForTimeout(400); return t.$$eval('#chips .chip', e => e.map(x => x.textContent)); };
+    const a1 = await chips('계약'), a2 = await chips('계약, -계약기간');
+    check(a1.includes('2쪽') && !a2.includes('2쪽') && a2.length === a1.length - 1 && /뺌/.test(await t.textContent('#summary')), `-낱말로 빼기: [${a1}] → [${a2}]`);
+    const b1 = await chips('손해를 베상하여야'), b2 = await chips('"손해를 베상하여야"');
+    check(b1.some(c => /\?/.test(c)) && b2.length === 0, `"따옴표"는 정확히만: [${b1}] → [${b2}]`);
+    check((await chips('-33-')).length >= 0 && !/빼는 말/.test(await t.textContent('#summary')), '-33- 같은 숫자는 빼기로 보지 않음');
+    await chips('계약기간, 1월');
+    await (await t.$('#hits .term .chip')).click(); await t.waitForTimeout(1500);
+    const sw = await t.$$eval('#pvNote .swatch', e => e.length);
+    check(sw === 2, `미리보기에서 낱말마다 다른 색: ${(await t.textContent('#pvNote')).slice(0, 60)}`);
+    await t.click('#pvClose');
+  }
+
   console.log('검색되는 PDF');
   {
     const os = require('os'), fs = require('fs');
