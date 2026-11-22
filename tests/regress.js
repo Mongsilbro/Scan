@@ -110,6 +110,26 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
     await t.click('#svClose');
   }
 
+  console.log('검색되는 PDF');
+  {
+    const os = require('os'), fs = require('fs');
+    await t.goto(html + '?nocache=1');
+    await t.setInputFiles('#file', [path.join(FX, 'scan.pdf'), path.join(FX, 'side_up.pdf')]);
+    await t.waitForFunction(() => { const s = [...document.querySelectorAll('#docs .doc small')]; return s.length === 2 && s.every(e => /완료/.test(e.textContent)); }, null, { timeout: 600000 });
+    for (const [i, f, q, pg] of [[1, 'scan', '손해 배상', 3], [2, 'side_up', '보증금 반환 청구', 1]]) {
+      const [dl] = await Promise.all([t.waitForEvent('download'), t.click(`#docs .doc:nth-child(${i}) button:text("검색되는 PDF")`)]);
+      const out = path.join(os.tmpdir(), `regress-${f}-searchable.pdf`); await dl.saveAs(out);
+      const t2 = await ctx.newPage(); await t2.goto(html + '?nocache=1');
+      await t2.setInputFiles('#file', out);
+      await t2.waitForFunction(() => /분석 완료|오류/.test(document.getElementById('status').textContent), null, { timeout: 300000 });
+      const st = await t2.textContent('#status'); await t2.fill('#q', q); await t2.waitForTimeout(400);
+      const got = await t2.$$eval('#chips .chip', e => e.map(x => x.textContent));
+      await (await t2.$('#chips .chip')).click(); await t2.waitForTimeout(1200);
+      check(/OCR 0쪽/.test(st) && got.includes(pg + '쪽') && /노란 상자/.test(await t2.textContent('#pvNote')), `${f}: 저장한 PDF를 다시 열면 OCR 없이 "${q}" → ${got} · 위치 표시`);
+      await t2.close(); fs.unlinkSync(out);
+    }
+  }
+
   console.log('네트워크');
   check(net === 0, `외부 접속 시도 ${net}건`);
   await b.close();

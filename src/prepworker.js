@@ -19,7 +19,7 @@ self.onmessage = e => {
       let table = null;
       if (seg && seg.cells.length && m.useTable) {
         const t = IP.tableImages(seg);
-        table = { rest: IP.grayOf(t.rest), strips: t.strips.map(IP.grayOf), restInk: t.restInk, sc: seg.sc };
+        table = { rest: IP.grayOf(t.rest), strips: t.strips.map(IP.grayOf), restInk: t.restInk, sc: seg.sc, places: t.places };
         tr.push(table.rest.gray.buffer, ...table.strips.map(s => s.gray.buffer));
       }
       const img = IP.grayOf(c); img.vertical = IP.linesAreVertical(c); tr.push(img.gray.buffer);

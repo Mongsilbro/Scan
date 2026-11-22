@@ -68,6 +68,14 @@ async function run(label, args, query) {
   await t.press('#q', 'Enter'); await t.waitForTimeout(200);
   check(await t.$eval('#recentQ', e => [...e.options].some(o => o.value === '계약기간, 보증금')), '최근 검색어 기억');
 
+  // 검색되는 PDF: 옆으로 누운 side.pdf 를 저장해 다시 열면 OCR 없이 글자 정보만으로 찾혀야 함
+  [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc:nth-child(2) button:text("검색되는 PDF")')]);
+  const spPath = path.join(require('os').tmpdir(), 'offline-searchable.pdf'); await dl.saveAs(spPath);
+  await t.goto(html + '?nocache=1&sp=1' + query); await t.setInputFiles('#file', spPath);
+  await t.waitForFunction(() => /분석 완료|오류/.test(document.getElementById('status').textContent), null, { timeout: 300000 });
+  const spSt = await t.textContent('#status'); await t.fill('#q', '보증금 반환 청구'); await t.waitForTimeout(400);
+  check(/OCR 0쪽/.test(spSt) && (await t.$$eval('#chips .chip', e => e.map(x => x.textContent))).includes('1쪽'), '검색되는 PDF 저장 → 다시 열면 OCR 없이 찾힘');
+
   // 다시 열기(브라우저에 저장된 결과)도 오프라인에서
   await t.goto(html + '?r=1' + query); await t.click('#clearCache');
   await t.setInputFiles('#file', path.join(FX, 'scan.pdf'));

@@ -46,7 +46,8 @@ assets = {
  'a-recworker': gz64(rd('src/recworker.js')),
  'a-prepworker': gz64(rd('src/prepworker.js')),
  'a-pdflib': gz64(rd(N+'pdf-lib/dist/pdf-lib.min.js')),          # 고른 쪽 PDF 만들기 (MIT)
- 'a-fflate': gz64(rd(N+'fflate/umd/index.js')),                  # 구역별 PDF를 ZIP으로 (MIT)
+ 'a-fflate': gz64(rd(N+'fflate/umd/index.js')),
+ 'a-glyphless': gz64(rd('models/glyphless.ttf')),                    # 검색되는 PDF 의 투명 글자용 빈 글꼴 (tools/make_glyphless.py)                  # 구역별 PDF를 ZIP으로 (MIT)
  'a-recmodel': gz64(rd(os.environ.get('REC_MODEL', 'models/rec_cpu.onnx'))),   # CPU용(8비트 행렬곱)
  'a-recgpu': gz64(rd('models/rec_gpu.onnx')),                                       # 그래픽카드용(실수 행렬곱)
  'a-recw': gz64(rd('models/rec_w.bin')),                                            # 두 모델이 함께 쓰는 가중치

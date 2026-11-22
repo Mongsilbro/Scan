@@ -184,7 +184,9 @@ function makeImgProc(CFG, mk, hooks = {}) {
         const inCell = l > 0 && isCell[l]; const v = inCell ? 255 : d[i];
         r[i] = r[i + 1] = r[i + 2] = v; r[i + 3] = 255; if (!inCell && bin[p]) restInk++; } }
     rx.putImageData(ro, 0, 0);
-    return { strips: canvases, rest, restInk };
+    // 칸 그림 안의 위치 → 쪽 위치로 되돌릴 때 씀: 칸마다 칸 그림에서의 세로 시작(ty)·높이(h), 쪽에서의 왼쪽 위(ax0 - pad, ay0)
+    const places = strips.map(s => s.items.map(({ c, y }) => ({ ty: y, h: c.ay1 - c.ay0 + 1, dx: c.ax0 - pad, dy: c.ay0 })));
+    return { strips: canvases, rest, restInk, places };
   }
 
   // 글줄 찾기: 글자를 가로로 번지게 해서 이어진 덩어리를 한 줄로 봄 (표 선은 넘지 않음). 줄마다 기울기도 구함

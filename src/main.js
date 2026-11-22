@@ -129,7 +129,19 @@
     if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
   } });
   const { enhance, rotated, linesAreVertical, segment, tableImages } = IP;
-  const OUT = { text: true, blocks: false, hocr: false, tsv: false };
+  const OUT = { text: true, blocks: false, hocr: false, tsv: true };   // tsv: 낱말 위치 (미리보기 노란 상자·검색되는 PDF 에 씀)
+  // Tesseract TSV → 글줄 [{ t, x0, y0, x1, y1 }] (그림 픽셀 좌표)
+  function tsvLines(tsv) {
+    const lines = new Map();
+    for (const row of (tsv || '').split('\n')) {
+      const c = row.split('\t'); if (c[0] !== '5' || c.length < 12) continue;
+      const t = c.slice(11).join('\t').trim(); if (!t) continue;
+      const k = c[2] + '.' + c[3] + '.' + c[4], x = +c[6], y = +c[7], x1 = x + +c[8], y1 = y + +c[9];
+      const L = lines.get(k); if (!L) lines.set(k, { t, x0: x, y0: y, x1, y1 });
+      else { L.t += ' ' + t; L.x0 = Math.min(L.x0, x); L.y0 = Math.min(L.y0, y); L.x1 = Math.max(L.x1, x1); L.y1 = Math.max(L.y1, y1); }
+    }
+    return [...lines.values()];
+  }
   // 그림을 압축 없는 회색 PGM 으로 넘김: 캔버스를 넘기면 PNG 로 압축(화면 쪽)하고 작업자가 다시 푸느라 시간이 듦. 픽셀은 같음
   // 그림은 캔버스이거나, 준비 작업자가 보낸 회색 값 { width, height, gray, vertical }
   function toPGM(img) {
@@ -150,7 +162,7 @@
     const body = text.replace(/\s/g, ''), letters = (body.match(/[가-힣A-Za-z]/g) || []).length;
     const ratio = body.length ? letters / body.length : 0;
     if (Q.get('debug')) console.log('recog', deg, 'conf', conf, 'ratio', ratio.toFixed(2), 'len', body.length, JSON.stringify(text.slice(0, 60)));
-    return { text, conf, deg, ratio, len: body.length, score: conf * (0.2 + ratio) };
+    return { text, conf, deg, ratio, len: body.length, score: conf * (0.2 + ratio), lines: deg ? null : tsvLines(r.tsv) };
   }
   // 반환: { text, deg } — deg 는 글자가 바로 서는 회전 각도
   async function ocrCanvas(w, canvas, knownDeg) {
@@ -181,14 +193,20 @@
   async function setPsm(w, v) { if (w.__psm !== v) { await w.setParameters({ tessedit_pageseg_mode: v }); w.__psm = v; } }
   // 표가 있는 쪽: 칸 밖은 일반 방식으로, 칸 안은 칸 단위로 읽음. 잘 안 읽히면 null (일반 방식으로 되돌아감)
   async function ocrTable(w, t, psm) {
-    const parts = []; let conf = 0, n = 0;
-    if (t.restInk > 80 * t.sc * t.sc) { await setPsm(w, psm); parts.push((await recog(w, t.rest, 0)).text); }
+    const parts = [], lines = []; let conf = 0, n = 0;
+    if (t.restInk > 80 * t.sc * t.sc) { await setPsm(w, psm); const r = await recog(w, t.rest, 0); parts.push(r.text); lines.push(...(r.lines || [])); }
     await setPsm(w, CFG.psmc);
     let ratio = 0;
-    for (const s of t.strips) { const r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; free(s); }
+    for (let si = 0; si < t.strips.length; si++) {
+      const s = t.strips[si], r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; free(s);
+      for (const L of r.lines || []) {      // 칸 그림 위치 → 쪽 위치
+        const cy = (L.y0 + L.y1) / 2, pl = (t.places[si] || []).find(p => cy >= p.ty && cy < p.ty + p.h + 1);
+        if (pl) lines.push({ t: L.t, x0: L.x0 + pl.dx, x1: L.x1 + pl.dx, y0: L.y0 - pl.ty + pl.dy, y1: L.y1 - pl.ty + pl.dy });
+      }
+    }
     free(t.rest);
     if (!n || conf / n < 45 || ratio / n < 0.35) return null;
-    return { text: parts.join('\n'), deg: 0, table: true, conf: conf / n };
+    return { text: parts.join('\n'), deg: 0, table: true, conf: conf / n, lines };
   }
   // 한 쪽을 그려서 읽음. 그린 뒤 전처리·표 찾기는 준비 작업자가 하고(있으면) 화면 쪽은 그리기만 함
   async function ocrPage(w, page, dpi, psm, knownDeg) {
@@ -207,9 +225,11 @@
       pr = { img: canvas, table: seg && seg.cells.length && !knownDeg ? Object.assign(tableImages(seg), { sc: seg.sc }) : null };
     }
     if (Q.get('debug')) console.log(`1차 render ${(P1 - P0) | 0}ms 전처리·표 찾기${remote ? '(작업자)' : ''} ${(performance.now() - P1) | 0}ms`);
+    const W1 = pr.img.width, H1 = pr.img.height;
     let res = pr.table ? await ocrTable(w, pr.table, psm) : null;
     if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, pr.img, knownDeg); res.canvas = pr.img; }
     else free(pr.img);
+    res.W = W1; res.H = H1;
     return res;
   }
 
@@ -536,6 +556,10 @@
             if (my !== runId) return;
             const r = await ocrPage(w, page, CFG.dpi1, CFG.psm);
             text = r.text;
+            if (r.lines && r.lines.length && !r.deg) {      // 낱말 위치가 있으면 글줄 단위 글자 + 위치 상자(0~1)
+              text = ''; tboxes = [];
+              for (const L of r.lines) { if (text) text += '\n'; tboxes.push([text.length, text.length + L.t.length, +(L.x0 / r.W).toFixed(4), +(L.y0 / r.H).toFixed(4), +(L.x1 / r.W).toFixed(4), +(L.y1 / r.H).toFixed(4), 0]); text += L.t; }
+            } else tboxes = null;
             if (!r.table && text.replace(/\s/g, '').length < 250 && my === runId) { await setPsm(w, '6'); text2 = (await ocrCanvas(w, r.canvas, r.deg)).text; }
             if (r.canvas) r.canvas.width = r.canvas.height = 0;
             ocrCount++; ocrPages.push(n); confOf[n] = r.conf || 0;
@@ -543,7 +567,7 @@
           }
           page.cleanup();
           if (my !== runId) return;
-          const layers = [Object.assign({ text, boxes: src === 'text' ? tboxes : null }, normalize(text))];
+          const layers = [Object.assign({ text, boxes: tboxes }, normalize(text))];
           if (text2) layers.push(Object.assign({ text: text2 }, normalize(text2)));
           pages[n - 1] = { n, src, layers };
           if (src === 'ocr' && pool2 && confOf[n] < CFG.skip2) { ready2.push(n); poke(); }
@@ -646,6 +670,8 @@
       if (d.state === 'err') st.className = 'err';
       row.append(nm, st);
       if (d.pdf) { const pg = document.createElement('button'); pg.textContent = '쪽 저장'; pg.title = '고른 쪽만 새 PDF로 저장'; pg.onclick = () => openSave(d); row.append(pg); }
+      if (n && d.state === 'done') { const sp = document.createElement('button'); sp.textContent = '검색되는 PDF'; sp.title = '인식된 글자를 투명하게 넣어, 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있는 PDF로 저장';
+        sp.onclick = async () => { sp.disabled = true; sp.textContent = '만드는 중…'; try { await saveSearchable(d); } catch (e) { console.error(e); alert('저장하지 못했습니다: ' + (e && e.message || e)); } sp.disabled = false; sp.textContent = '검색되는 PDF'; }; row.append(sp); }
       if (n) { const sv = document.createElement('button'); sv.textContent = '글자 저장'; sv.title = '인식된 글자를 텍스트 파일로 저장'; sv.onclick = () => saveText(d); row.append(sv); }
       const rm = document.createElement('button'); rm.textContent = '×'; rm.title = '목록에서 빼기'; rm.setAttribute('aria-label', d.name + ' 목록에서 빼기');
       rm.onclick = () => removeDoc(d); row.append(rm);
@@ -726,13 +752,89 @@
     $('svNote').className = bad.length ? 'err' : '';
     $('svGo').disabled = !!bad.length || !n;
   }
+  // ---------- 검색되는 PDF: 스캔 그림은 그대로 두고 인식된 글자를 투명하게 겹쳐 넣음 ----------
+  // (Acrobat 'Searchable Image', OCRmyPDF 와 같은 방식) 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있음
+  // 글꼴: 모양 없는 글꼴(models/glyphless.ttf, 624바이트) + ToUnicode 로 글자 정보. 한글 글꼴을 넣지 않아 파일이 거의 안 커짐
+  let glyphless = null;
+  async function ocrFont(out) {
+    const P = PDFLib, ctx = out.context;
+    if (!glyphless) glyphless = await asset('a-glyphless', true);
+    const map = new Uint8Array(65536 * 2); for (let i = 0; i < 65536; i++) map[i * 2 + 1] = 1;     // 모든 글자 → 빈 글리프 1
+    const cmap = '/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n' +
+      '/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange\n' +
+      'endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n';
+    const desc = ctx.obj({ Type: 'FontDescriptor', FontName: 'GlyphLessFont', Flags: 5, FontBBox: [0, 0, 500, 1000], ItalicAngle: 0, Ascent: 1000, Descent: 0, CapHeight: 1000, StemV: 80,
+      FontFile2: ctx.register(ctx.flateStream(glyphless, { Length1: glyphless.length })) });
+    const cid = ctx.obj({ Type: 'Font', Subtype: 'CIDFontType2', BaseFont: 'GlyphLessFont', DW: 500, FontDescriptor: ctx.register(desc),
+      CIDSystemInfo: ctx.obj({ Registry: P.PDFString.of('Adobe'), Ordering: P.PDFString.of('Identity'), Supplement: 0 }), CIDToGIDMap: ctx.register(ctx.flateStream(map)) });
+    return ctx.register(ctx.obj({ Type: 'Font', Subtype: 'Type0', BaseFont: 'GlyphLessFont', Encoding: 'Identity-H', DescendantFonts: [ctx.register(cid)], ToUnicode: ctx.register(ctx.flateStream(cmap)) }));
+  }
+  // 원본 n 쪽의 인식 결과를 outPage 에 투명 글자로 넣음. 넣은 글줄 수를 돌려줌
+  // up: 바로 세운 새 쪽에 넣을 때의 그 쪽 보기(viewport). 없으면 원래 쪽 좌표 그대로
+  async function addTextLayer(outPage, fontRef, d, n, up) {
+    const p = d.pages[n - 1]; if (!p || p.src !== 'ocr') return 0;      // 원래 글자 정보가 있는 쪽은 그대로
+    const P = PDFLib, vp = (await d.pdf.getPage(n)).getViewport({ scale: 1 }), W = vp.width, H = vp.height;
+    const pt = (x, y) => {                                                // 화면(0~1) → PDF 좌표 (쪽 회전·여백 반영)
+      const u = vp.convertToPdfPoint(x * W, y * H); if (!up) return u;
+      const v = up.convertToViewportPoint(u[0], u[1]); return [v[0], up.height - v[1]];
+    };
+    const Ls = p.layers.filter(l => l.boxes && l.boxes.length), lines = [];     // 2차(신경망)와 1차(Tesseract) 결과를 모두 넣어 어느 쪽으로든 찾히게
+    for (const L of Ls) for (const [s, e, x0, y0, x1, y1, rot] of L.boxes) {
+      // 글줄이 놓인 방향: 시작점·끝점(글자 아래쪽)과 위쪽 점
+      const g = rot === 180 ? [[x1, y0], [x0, y0], [x1, y1]] : rot === 90 ? [[x1, y1], [x1, y0], [x0, y1]] : rot === 270 ? [[x0, y0], [x0, y1], [x1, y0]] : [[x0, y1], [x1, y1], [x0, y0]];
+      lines.push([L.text.slice(s, e), ...g]);
+    }
+    if (!Ls.length) {     // 위치 정보가 없는 결과: 찾기·복사는 되도록 왼쪽 위부터 차례로 작게
+      p.layers[0].text.split('\n').filter(t => t.trim()).forEach((t, i) => { const y = 0.02 + i * 0.012; if (y < 0.98) lines.push([t, [0.02, y + 0.01], [0.98, y + 0.01], [0.02, y]]); });
+    }
+    if (!lines.length) return 0;
+    const name = outPage.node.newFontDictionary('OCR', fontRef);
+    const ops = [P.pushGraphicsState(), P.beginText(), P.setTextRenderingMode(P.TextRenderingMode.Invisible)];
+    for (const [text, a, b, c] of lines) {
+      const t = text.replace(/\s+/g, ' ').trim(); if (!t) continue;
+      const A = pt(...a), B = pt(...b), C = pt(...c);
+      const ux = B[0] - A[0], uy = B[1] - A[1], len = Math.hypot(ux, uy), vx = C[0] - A[0], vy = C[1] - A[1], h = Math.hypot(vx, vy);
+      if (len < 1 || h < 1) continue;
+      let hex = ''; for (let i = 0; i < t.length; i++) hex += t.charCodeAt(i).toString(16).padStart(4, '0');
+      ops.push(P.setFontAndSize(name, h), P.setCharacterSqueeze(100 * len / (t.length * 0.5 * h)),
+        P.setTextMatrix(ux / len, uy / len, vx / h, vy / h, A[0], A[1]), P.showText(P.PDFHexString.of(hex)));
+    }
+    ops.push(P.endText(), P.popGraphicsState());
+    outPage.pushOperators(...ops);
+    return lines.length;
+  }
+  // 신경망이 쪽을 돌려 읽었으면 그 각도(모든 글줄이 같을 때만)
+  const pageTurn = (d, n) => { const p = d.pages[n - 1]; if (!p || p.src !== 'ocr') return 0;
+    const r = p.layers.flatMap(L => L.boxes ? L.boxes.map(b => b[6] || 0) : []); return r.length && r.every(x => x === r[0]) ? r[0] : 0; };
+  // src(pdf-lib 원본)의 ns 쪽을 out 에 차례로 넣음. font 가 있으면 투명 글자도.
+  // 눕거나 뒤집힌 쪽은 내용을 바로 세워 새 쪽에 그리고 글자를 가로로 넣음 — 그래야 PDF 보기 프로그램(크롬 등)의 찾기가 됨
+  async function addPages(out, src, d, ns, font) {
+    const P = PDFLib, copied = await out.copyPages(src, ns.map(n => n - 1));
+    for (let i = 0; i < ns.length; i++) {
+      const n = ns[i], turn = font ? pageTurn(d, n) : 0;
+      if (!turn) { out.addPage(copied[i]); if (font) await addTextLayer(copied[i], font, d, n); continue; }
+      const pj = await d.pdf.getPage(n), up = pj.getViewport({ scale: 1, rotation: (pj.rotate + turn) % 360 });
+      const emb = await out.embedPage(src.getPage(n - 1), undefined, [1, 0, 0, 1, 0, 0]);    // 원래 좌표 그대로인 묶음
+      const pg = out.addPage([up.width, up.height]), [a, b, c, e, f, g] = up.transform;     // PDF 좌표 → 바로 세운 보기(아래로 y)
+      const name = pg.node.newXObject('Orig', emb.ref);
+      pg.pushOperators(P.pushGraphicsState(), P.concatTransformationMatrix(a, -b, c, -e, f, up.height - g), P.drawObject(name), P.popGraphicsState());
+      await addTextLayer(pg, font, d, n, up);
+    }
+  }
+  async function saveSearchable(d) {
+    await pdfLibs();
+    const src = await PDFLib.PDFDocument.load(await d.file.arrayBuffer(), { ignoreEncryption: true }), out = await PDFLib.PDFDocument.create();
+    await addPages(out, src, d, Array.from({ length: d.total }, (_, i) => i + 1), await ocrFont(out));
+    download(new Blob([await out.save()], { type: 'application/pdf' }), `${d.name.replace(/\.pdf$/i, '')} (검색 가능).pdf`);
+  }
   async function savePages() {
     const dlg = $('saveDlg'), d = dlg.__ds[+$('svFile').value], { groups } = parseRanges($('svPages').value, d.total), split = $('svSplit').checked;
     const go = $('svGo'); go.disabled = true; go.textContent = '만드는 중…';
     try {
       await pdfLibs();
       const src = await PDFLib.PDFDocument.load(await d.file.arrayBuffer(), { ignoreEncryption: true });
-      const make = async ns => { const out = await PDFLib.PDFDocument.create(); for (const pg of await out.copyPages(src, ns.map(n => n - 1))) out.addPage(pg); return out.save(); };
+      const withText = $('svText').checked;
+      const make = async ns => { const out = await PDFLib.PDFDocument.create(); await addPages(out, src, d, ns, withText ? await ocrFont(out) : null); return out.save(); };
       const base = d.name.replace(/\.pdf$/i, '');
       if (split && groups.length > 1) {
         const files = {};
