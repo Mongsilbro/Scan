@@ -468,6 +468,10 @@
       await new Promise(ok => { tx.oncomplete = ok; tx.onerror = ok; });
     } catch (e) { console.warn('결과 저장 실패', e); }
   }
+  async function cacheAll() {
+    try { const db = await idb(); return await new Promise(ok => { const r = db.transaction('docs').objectStore('docs').getAll(); r.onsuccess = () => ok(r.result || []); r.onerror = () => ok([]); }); }
+    catch (e) { return []; }
+  }
   async function cacheClear() {
     try { const db = await idb(); const tx = db.transaction('docs', 'readwrite'); tx.objectStore('docs').clear(); await new Promise(ok => { tx.oncomplete = ok; tx.onerror = ok; }); } catch (e) {}
   }
@@ -487,6 +491,7 @@
       const data = await file.arrayBuffer();
       const optsKey = ($('force').checked ? 'F' : '-') + ($('fine').checked ? 'P' : '-');
       const key = Q.get('nocache') ? null : await fileKey(data.slice(0), optsKey);
+      for (const x of docs.filter(x => x.saved && x !== me && (x.key === key || (x.name === me.name && x.total)))) docs.splice(docs.indexOf(x), 1);
       const doc = await pdfjsLib.getDocument({ data, CMapReaderFactory: EmbeddedCMaps, cMapPacked: true }).promise;
       if (my !== runId) return;
       pdf = doc; total = doc.numPages; bar.max = total; me.pdf = doc; me.total = total;
@@ -496,7 +501,7 @@
         if (hit && hit.total === total) {
           pages = hit.pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => Object.assign({ text: L.t, boxes: L.b || null }, normalize(L.t))) }));
           running = false; bar.value = total; $('stop').classList.add('hidden');
-          me.pages = pages; me.state = 'done'; me.note = '저장된 결과';
+          me.pages = pages; me.state = 'done'; me.note = '저장된 결과'; me.key = key;
           const when = new Date(hit.at).toLocaleString();
           setStatus(`${docPrefix(me)}저장해 둔 분석 결과를 불러왔습니다 (전체 ${total}쪽, ${when} 분석) · 바로 검색할 수 있습니다`, 'ok');
           search(); runNext(); return;
@@ -629,6 +634,7 @@
       let gpuNote = '';
       if (pool2 && pool2.st.gpuN) gpuNote = ` · 그래픽카드가 글줄 ${Math.round(pool2.st.gpuN / (pool2.st.gpuN + pool2.st.cpuN) * 100)}% 판독`;
       else if (pool2 && ocrCount && Q.get('debug')) gpuNote = ` · 그래픽카드 안 씀(${GPU.state === 'loading' ? '준비가 끝나기 전에 분석이 끝남' : GPU.why || pool2.st.gpuWhy || '쓸 일이 없었음'})`;   // 안 쓴 까닭은 아래 줄에 늘 보임
+      if (key) { me.key = key; refreshSaved(); }
       me.state = 'done'; me.note = sec + '초';
       setStatus(`${docPrefix(me)}분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}${gpuNote}${Q.get('debug') ? ` · 화면 쪽 작업 ${Math.round((mainBusy - busy0) / 1000)}초` : ''}`, 'ok');
       search(); runNext();
@@ -656,10 +662,11 @@
     const waiting = queue.length, pct = bar.max ? Math.round(bar.value / bar.max * 100) : 0;
     document.title = running ? `(${pct}%${waiting ? `, 남은 파일 ${waiting}개` : ''}) ${baseTitle}` : docs.some(d => d.state === 'done') ? `✓ 분석 완료 · ${baseTitle}` : baseTitle;
     listEl.innerHTML = '';
+    savedBtn();
     if (!docs.length) return;
     $('dropTitle').textContent = docs.length === 1 ? docs[0].name : `파일 ${docs.length}개`;
     $('dropSub').textContent = '파일을 더 넣으려면 다시 누르거나 끌어다 놓으세요 (여러 개 한꺼번에 가능)';
-    const label = { wait: '대기', run: '분석 중', done: '완료', stop: '중지됨', err: '오류' };
+    const label = { wait: '대기', run: '분석 중', done: '완료', stop: '중지됨', err: '오류', saved: '저장된 결과' };
     for (const d of docs) {
       const row = document.createElement('div'); row.className = 'doc';
       const nm = document.createElement('span'); nm.className = 'doc-name'; nm.textContent = d.name;
@@ -670,7 +677,7 @@
       if (d.state === 'err') st.className = 'err';
       row.append(nm, st);
       if (d.pdf) { const pg = document.createElement('button'); pg.textContent = '쪽 저장'; pg.title = '고른 쪽만 새 PDF로 저장'; pg.onclick = () => openSave(d); row.append(pg); }
-      if (n && d.state === 'done') { const sp = document.createElement('button'); sp.textContent = '검색되는 PDF'; sp.title = '인식된 글자를 투명하게 넣어, 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있는 PDF로 저장';
+      if (n && d.state === 'done' && d.pdf) { const sp = document.createElement('button'); sp.textContent = '검색되는 PDF'; sp.title = '인식된 글자를 투명하게 넣어, 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있는 PDF로 저장';
         sp.onclick = async () => { sp.disabled = true; sp.textContent = '만드는 중…'; try { await saveSearchable(d); } catch (e) { console.error(e); alert('저장하지 못했습니다: ' + (e && e.message || e)); } sp.disabled = false; sp.textContent = '검색되는 PDF'; }; row.append(sp); }
       if (n) { const sv = document.createElement('button'); sv.textContent = '글자 저장'; sv.title = '인식된 글자를 텍스트 파일로 저장'; sv.onclick = () => saveText(d); row.append(sv); }
       const rm = document.createElement('button'); rm.textContent = '×'; rm.title = '목록에서 빼기'; rm.setAttribute('aria-label', d.name + ' 목록에서 빼기');
@@ -685,9 +692,33 @@
       row.append(sp, b); listEl.appendChild(row);
     }
   }
+  // 이전에 분석해 이 브라우저에 저장된 결과를 목록에 올려, 원본 PDF 없이도 찾을 수 있게 함
+  let savedCount = 0;
+  const savedEl = document.createElement('div'); savedEl.className = 'doc-all saved-row';
+  listEl.insertAdjacentElement('afterend', savedEl);
+  async function refreshSaved() { savedCount = (await cacheAll()).length; renderDocs(); }
+  function savedBtn() {
+    const shown = new Set(docs.map(d => d.key).filter(Boolean)), n = savedCount - [...shown].length;
+    savedEl.innerHTML = '';
+    if (savedCount && n > 0) {
+      const b = document.createElement('button'); b.textContent = `이전에 분석한 파일 불러오기 (${n}개, 원본 없이 찾기)`;
+      b.title = '이 브라우저에 저장된 분석 결과를 목록에 올립니다. 원본 PDF 없이도 찾을 수 있고, 미리보기는 인식된 글자로 보여 줍니다';
+      b.onclick = loadSaved; savedEl.appendChild(b);
+    }
+  }
+  async function loadSaved() {
+    const recs = (await cacheAll()).sort((a, b) => b.at - a.at);
+    for (const r of recs) {
+      if (docs.some(d => d.key === r.key)) continue;
+      const pages = r.pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => Object.assign({ text: L.t, boxes: L.b || null }, normalize(L.t))) }));
+      docs.push({ file: null, pdf: null, name: r.name, key: r.key, saved: true, total: r.total, pages, state: 'saved', note: new Date(r.at).toLocaleDateString() + ' 분석 · 원본 없음' });
+    }
+    renderDocs(); search();
+  }
   function removeDoc(d) {
     const qi = queue.indexOf(d.file); if (qi >= 0) queue.splice(qi, 1);
     if (d === curDoc && running) { stopRun(); }
+    if (d.saved) { docs.splice(docs.indexOf(d), 1); renderDocs(); search(); return; }
     docs.splice(docs.indexOf(d), 1);
     if (d.pdf && d.pdf !== pdf) d.pdf.destroy().catch(() => {});
     if (!docs.length) { $('dropTitle').textContent = '여기를 눌러 PDF를 선택하거나, 파일을 끌어다 놓으세요'; $('dropSub').textContent = '스캔본 · 일반 PDF 모두 가능 · 여러 파일 한꺼번에 가능'; curFile = null; setStatus(''); bar.classList.add('hidden'); }
@@ -1048,7 +1079,7 @@
   let pvSeq = 0, pvCur = null;
   // idx: 검색 결과 목록에서의 차례. 'keep' 이면 결과 위치는 그대로 두고 쪽만 넘김
   async function preview(d, n, raw, idx) {
-    if (!d.pdf || n < 1 || n > d.total) return;
+    if (n < 1 || n > d.total) return;
     const my = ++pvSeq, pages = d.pages; if (idx !== 'keep') navI = idx === undefined ? -1 : idx; pvCur = { d, n, raw };
     $('pvPgPrev').disabled = n <= 1; $('pvPgNext').disabled = n >= d.total;
     $('pvTitle').textContent = (docs.length > 1 ? d.name + ' · ' : '') + `${n}쪽 / 전체 ${d.total}쪽`;
@@ -1058,7 +1089,14 @@
     if (navI >= 0 && !onHit) $('pvPos').textContent = `(결과 ${navI + 1}/${nav.length} 근처)`;
     $('pvText').textContent = pages[n - 1] ? pages[n - 1].layers.map(L => L.text).join('\n──────── 2차 판독 ────────\n') : '';
     const dlg = $('dlg'); if (!dlg.open) dlg.showModal();
-    $('pvNote').textContent = '';
+    $('pvNote').textContent = ''; $('pvSave').disabled = !d.pdf;
+    const det = $('pvText').closest('details');
+    if (!d.pdf) {           // 이전에 분석한 결과만 있음: 그림 없이 인식된 글자만
+      const pv = $('pv'); pv.width = pv.height = 0; det.open = true;
+      $('pvNote').textContent = '원본 PDF 없이 저장된 결과만 있어 그림은 볼 수 없습니다. 아래 인식된 글자를 보세요. 이 파일을 다시 넣으면 그림과 위치 표시가 나옵니다.';
+      return;
+    }
+    det.open = false;
     const page = await d.pdf.getPage(n);
     const c = await renderToCanvas(page, 2.2, 2400);
     if (my !== pvSeq) { c.width = c.height = 0; return; }      // 그사이 다른 결과로 넘김
@@ -1100,7 +1138,7 @@
     const ok = files.filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
     if (!ok.length) { if (files.length) setStatus('PDF 파일만 사용할 수 있습니다.', 'err'); return; }
     for (const f of ok) {
-      if (docs.some(d => d.name === f.name && d.file.size === f.size && d.state !== 'err')) continue;   // 이미 목록에 있는 파일
+      if (docs.some(d => d.file && d.name === f.name && d.file.size === f.size && d.state !== 'err')) continue;   // 이미 목록에 있는 파일
       docs.push({ file: f, name: f.name, pages: [], total: 0, state: 'wait', note: '' }); queue.push(f);
     }
     renderDocs(); runNext();
@@ -1154,10 +1192,11 @@
   $('force').onchange = $('fine').onchange = () => {    // 설정이 바뀌면 목록의 파일을 모두 다시 분석
     if (!docs.length) return;
     if (running) stopRun();
-    queue.splice(0); for (const d of docs) { d.state = 'wait'; d.note = ''; queue.push(d.file); }
+    queue.splice(0); for (const d of docs.filter(x => x.file)) { d.state = 'wait'; d.note = ''; queue.push(d.file); }
     renderDocs(); runNext();
   };
-  $('clearCache').onclick = async () => { await cacheClear(); $('clearCache').textContent = '저장된 결과를 지웠습니다'; };
+  $('clearCache').onclick = async () => { await cacheClear(); $('clearCache').textContent = '저장된 결과를 지웠습니다'; for (const d of docs.filter(x => x.saved)) docs.splice(docs.indexOf(d), 1); refreshSaved(); search(); };
+  refreshSaved();
   $('go').onclick = () => { search(); remember(); };
   // 설정과 최근 검색어를 이 브라우저에 기억(없거나 막혀 있으면 그냥 넘어감)
   const store = { get: k => { try { return JSON.parse(localStorage.getItem('ppf.' + k)); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem('ppf.' + k, JSON.stringify(v)); } catch (e) {} } };

@@ -127,6 +127,28 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
     await t.click('#pvClose');
   }
 
+  console.log('이전에 분석한 파일(원본 없이) 찾기');
+  {
+    await t.goto(html); await t.click('#clearCache'); await t.waitForTimeout(200);
+    await t.setInputFiles('#file', [path.join(FX, 'scan.pdf'), path.join(FX, 'side.pdf')]);
+    await t.waitForFunction(() => { const s = [...document.querySelectorAll('#docs .doc small')]; return s.length === 2 && s.every(e => /완료/.test(e.textContent)); }, null, { timeout: 600000 });
+    await t.goto(html + '?again=1'); await t.waitForSelector('.saved-row button', { timeout: 10000 });
+    const label = await t.textContent('.saved-row button'); await t.click('.saved-row button'); await t.waitForTimeout(300);
+    const rows = await t.$$eval('#docs .doc small', e => e.map(x => x.textContent));
+    check(/2개/.test(label) && rows.length === 2 && rows.every(r => /저장된 결과/.test(r)), `불러오기: ${label} → ${rows.join(' / ')}`);
+    await t.fill('#q', '보증금 반환 청구'); await t.waitForTimeout(400);
+    const f = await t.$$eval('#chips .chips', e => e.map(x => x.textContent));
+    check(f.some(x => /side\.pdf/.test(x) && /1쪽/.test(x)), `원본 없이 찾기: ${f}`);
+    await (await t.$('#chips .chip')).click(); await t.waitForTimeout(600);
+    check(/원본 PDF 없이/.test(await t.textContent('#pvNote')) && /보증금/.test(await t.textContent('#pvText')), '미리보기는 인식된 글자로');
+    await t.click('#pvClose');
+    await t.setInputFiles('#file', path.join(FX, 'scan.pdf'));
+    await t.waitForFunction(() => [...document.querySelectorAll('#docs .doc small')].some(e => /완료/.test(e.textContent)), null, { timeout: 120000 });
+    const rows2 = await t.$$eval('#docs .doc', e => e.map(x => x.textContent));
+    check(rows2.length === 2 && rows2.some(r => /scan\.pdf/.test(r) && /완료/.test(r) && /검색되는 PDF/.test(r)), `원본을 넣으면 그 항목을 대신함: ${rows2.length}개`);
+    await t.click('#clearCache');
+  }
+
   console.log('검색되는 PDF');
   {
     const os = require('os'), fs = require('fs');

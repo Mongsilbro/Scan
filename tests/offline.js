@@ -83,6 +83,9 @@ async function run(label, args, query) {
   await t.goto(html + '?r=1' + query); await t.setInputFiles('#file', path.join(FX, 'scan.pdf'));
   await t.waitForFunction(() => /불러왔습니다|분석 완료|오류/.test(document.getElementById('status').textContent), null, { timeout: 600000 });
   check(/불러왔습니다/.test(await t.textContent('#status')), '저장된 결과 다시 불러오기');
+  await t.goto(html + '?r=2' + query); await t.waitForSelector('.saved-row button', { timeout: 10000 }); await t.click('.saved-row button');
+  await t.fill('#q', '손해 배상'); await t.waitForTimeout(400);
+  check((await t.$$eval('#chips .chip', e => e.map(x => x.textContent))).includes('3쪽'), '이전에 분석한 파일을 원본 없이 불러와 찾기');
   await t.click('#clearCache');
 
   check(!errs.length, '오류 없음' + (errs.length ? ': ' + errs.slice(0, 3).join(' | ') : ''));
