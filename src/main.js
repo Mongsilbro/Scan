@@ -2,7 +2,9 @@
   const $ = id => document.getElementById(id);
   const drop = $('drop'), fileInput = $('file'), bar = $('bar'), statusEl = $('status');
   const qEl = $('q'), hitsEl = $('hits'), chipsEl = $('chips'), summaryEl = $('summary');
-  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+  $('pv').setAttribute('role', 'img'); $('pv').setAttribute('aria-label', '쪽 그림');
+  const announcer = document.createElement('div'); announcer.className = 'sr-only'; announcer.setAttribute('role', 'status'); document.body.appendChild(announcer);
+  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; if (cls) announcer.textContent = msg; }   // 완료·오류만 화면 읽기 프로그램에 알림
   let early = null;                     // 준비가 끝나기 전에 고른 파일은 기억했다가 준비되면 분석
   fileInput.onchange = () => { early = [...fileInput.files]; };
   const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -954,20 +956,33 @@
     }).filter(x => normalize(x.t).out);
     const pos = parsed.filter(x => !x.neg), negs = parsed.filter(x => x.neg), terms = pos.map(x => x.t);
     curTerms = terms;
+    $('resTools').classList.add('hidden');
     hitsEl.innerHTML = ''; chipsEl.innerHTML = ''; nav = []; lastCopy = ''; lastRows = []; $('copyRes').classList.add('hidden'); $('saveRes').classList.add('hidden'); $('csvRes').classList.add('hidden');
     const ds = docs.filter(d => d.pages && d.pages.some(Boolean));
     if (!ds.length || !parsed.length) { summaryEl.textContent = ''; return; }
     if (!terms.length) { summaryEl.textContent = '빼는 말(-낱말)만 있습니다. 찾을 말도 함께 적어 주세요.'; return; }
+    // 결과 보기: 파일 하나만 / 많이 나온 순
+    const fSel = $('fFile'), keep = fSel.value; fSel.innerHTML = '';
+    if (ds.length > 1) { [['', `모든 파일 (${ds.length}개)`]].concat(ds.map((d, i) => [String(i), d.name])).forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; fSel.appendChild(o); }); fSel.value = [...fSel.options].some(o => o.value === keep) ? keep : ''; }
+    $('fFileWrap').classList.toggle('hidden', ds.length < 2);
+    const only = ds.length > 1 && fSel.value !== '' ? ds[+fSel.value] : null, byCount = $('fSort').value === 'count';
     const multiDoc = ds.length > 1, done = ds.reduce((s, d) => s + d.pages.filter(Boolean).length, 0), all = ds.reduce((s, d) => s + d.total, 0);
     const partial = !running && !queue.length ? '' : done >= all && !queue.length ? ' (정밀 판독 중이라 결과가 더 나올 수 있습니다)' : ` (지금까지 분석한 ${done}쪽 기준)`;
     // 빼는 말이 (정확히) 있는 쪽
     const excl = new Map(ds.map(d => [d, new Set(negs.flatMap(x => findIn(d, x.t, 0).map(f => f.p.n)))]));
-    const res = pos.map(x => ({ t: x.t, per: ds.map(d => ({ d, found: findIn(d, x.t, x.exact ? 0 : undefined).filter(f => !excl.get(d).has(f.p.n)) })) }));
+    const view = only ? [only] : ds;
+    const res = pos.map(x => {
+      const per = view.map(d => { const found = findIn(d, x.t, x.exact ? 0 : undefined).filter(f => !excl.get(d).has(f.p.n));
+        if (byCount) found.sort((a, b) => (a.fuzzy - b.fuzzy) || (b.spans.length - a.spans.length) || (a.p.n - b.p.n)); return { d, found }; });
+      if (byCount) per.sort((a, b) => b.found.reduce((s, f) => s + f.spans.length, 0) - a.found.reduce((s, f) => s + f.spans.length, 0));
+      return { t: x.t, per };
+    });
+    $('resTools').classList.remove('hidden');
     const exclNote = negs.length ? ` · "${negs.map(x => x.t).join('", "')}" 이(가) 있는 쪽 ${[...excl.values()].reduce((s, v) => s + v.size, 0)}개 뺌` : '';
     const copy = [];
     // 여러 낱말: 모두 들어 있는 쪽
     if (terms.length > 1) {
-      const both = ds.map(d => ({ d, ns: d.pages.filter(Boolean).map(p => p.n).filter(n => res.every(r => r.per.find(x => x.d === d).found.some(f => f.p.n === n))) })).filter(x => x.ns.length);
+      const both = view.map(d => ({ d, ns: d.pages.filter(Boolean).map(p => p.n).filter(n => res.every(r => r.per.find(x => x.d === d).found.some(f => f.p.n === n))) })).filter(x => x.ns.length);
       const box = document.createElement('div'); box.className = 'term';
       const h = document.createElement('div'); h.className = 'term-head';
       h.textContent = both.length ? `모두 들어 있는 쪽 (${terms.join(' + ')})` : `"${terms.join('", "')}" 이(가) 모두 들어 있는 쪽은 없습니다`;
@@ -1006,7 +1021,7 @@
         }
       }
     }
-    const where = multiDoc ? `파일 ${ds.length}개 · ` : '';
+    const where = only ? `${only.name} · ` : multiDoc ? `파일 ${ds.length}개 · ` : '';
     if (!totPages && !totFz) {
       summaryEl.textContent = `${where}"${terms.join('", "')}" 을(를) 찾지 못했습니다${exclNote}${partial}.` + (running ? '' : ' 스캔 상태가 흐리면 인식이 틀릴 수 있으니 더 짧은 단어로도 찾아보세요.');
       return;
@@ -1023,6 +1038,7 @@
   function chipFor(d, n, t, fuzzy) {
     const chip = document.createElement('button');
     chip.className = 'chip' + (fuzzy ? ' fz' : ''); chip.textContent = n + '쪽' + (fuzzy ? ' ?' : '');
+    chip.setAttribute('aria-label', (docs.length > 1 ? d.name + ' ' : '') + n + '쪽' + (fuzzy ? ', 비슷한 표현' : ''));
     chip.title = (fuzzy ? '글자가 조금 다른 비슷한 표현' : '정확히 일치') + (docs.length > 1 ? ' · ' + d.name : '');
     const idx = nav.length; nav.push({ d, n, t });
     chip.onclick = () => preview(d, n, t, idx);
@@ -1100,7 +1116,7 @@
     const page = await d.pdf.getPage(n);
     const c = await renderToCanvas(page, 2.2, 2400);
     if (my !== pvSeq) { c.width = c.height = 0; return; }      // 그사이 다른 결과로 넘김
-    const pv = $('pv'); pv.width = c.width; pv.height = c.height; applyZoom();
+    const pv = $('pv'); pv.width = c.width; pv.height = c.height; applyZoom(); pv.setAttribute('aria-label', `${d.name} ${n}쪽 그림`);
     const ctx = pv.getContext('2d'); ctx.drawImage(c, 0, 0); c.width = c.height = 0;
     // 찾은 말이 여럿이면 말마다 다른 색 (누른 말을 맨 앞에)
     const ts = raw ? [raw].concat(curTerms.filter(t => t !== raw)) : [];
@@ -1209,6 +1225,7 @@
   }
   showRecent();
   $('fuzzy').onchange = search;
+  $('fFile').onchange = $('fSort').onchange = search;
   let typing = null;
   qEl.oninput = () => { clearTimeout(typing); typing = setTimeout(search, 150); };
   qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); remember(); } };

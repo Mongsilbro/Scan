@@ -67,6 +67,12 @@
   details { margin-top: 10px; font-size: .9rem; }
   #pvText { white-space: pre-wrap; max-height: 200px; overflow: auto; color: var(--muted); }
   .hidden { display: none; }
+  .guide { margin: -8px 0 16px; font-size: .92rem; }
+  .guide summary { cursor: pointer; color: var(--accent); font-weight: 600; }
+  .guide ol { margin: 8px 0; padding-left: 1.4em; } .guide li { margin: 4px 0; } .guide ul { padding-left: 1.2em; }
+  .guide p { color: var(--muted); margin: 6px 0 0; }
+  code { background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 0 4px; font-size: .9em; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
   #docs { margin-top: 10px; display: grid; gap: 4px; }
   .doc { display: flex; align-items: center; gap: 10px; font-size: .9rem; border-bottom: 1px solid var(--line); padding: 4px 0; }
   .doc-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
@@ -105,6 +111,22 @@
   <h1>스캔 PDF 페이지 찾기</h1>
   <p class="sub">스캔한 PDF의 글자를 인식(OCR)해서, 찾는 내용이 몇 페이지에 있는지 알려줍니다. 인터넷 연결 없이 이 파일 하나로 동작하며, PDF는 이 컴퓨터 안에서만 처리됩니다.</p>
 
+  <details class="guide">
+    <summary>사용법 보기</summary>
+    <ol>
+      <li><b>파일 넣기</b> — PDF를 끌어다 놓거나 눌러서 고릅니다. 여러 개를 한꺼번에 넣으면 차례로 분석합니다. 한 번 분석한 파일은 이 브라우저에 결과가 저장되어 다음에는 바로 열립니다.</li>
+      <li><b>찾기</b> — 찾을 말을 적습니다. 띄어쓰기·대소문자는 무시합니다.
+        <ul>
+          <li>여러 낱말: <code>계약 기간, 손해배상</code> (쉼표로 나눔, 모두 들어 있는 쪽도 보여 줌)</li>
+          <li>정확히 같은 것만: <code>"손해 배상"</code> · 그 말이 있는 쪽 빼기: <code>-계약기간</code></li>
+          <li>글자가 조금 틀리게 인식된 비슷한 표현도 찾아 <code>3쪽 ?</code>처럼 따로 표시합니다.</li>
+        </ul></li>
+      <li><b>미리보기</b> — 쪽 번호를 누르면 찾은 위치가 색 상자로 보입니다. ← → 다음 결과, PageUp/PageDown 앞뒤 쪽, + − 0 확대. <code>/</code> 키는 검색창으로.</li>
+      <li><b>저장</b> — 결과 복사(쪽 번호) · 엑셀로 저장 · 찾은 쪽만 새 PDF로(구역별 ZIP 가능) · 검색되는 PDF(어느 PDF 보기 프로그램에서든 Ctrl+F로 찾기) · 인식된 글자(.txt).</li>
+      <li><b>이전에 분석한 파일</b> — "이전에 분석한 파일 불러오기"로 원본 없이도 지난 결과에서 찾습니다.</li>
+    </ol>
+    <p>인터넷 연결 없이 동작하며, PDF와 분석 결과는 이 컴퓨터 밖으로 나가지 않습니다. 정밀 판독은 켜 두기를 권합니다(끄면 영어·숫자를 많이 놓침).</p>
+  </details>
   <div class="card">
     <div class="step">1. PDF 파일 선택</div>
     <div id="drop" tabindex="0" role="button">
@@ -134,13 +156,17 @@
       <button class="primary" id="go">찾기</button>
     </div>
     <div class="row" style="color:var(--muted)">띄어쓰기와 영문 대소문자는 무시하고 찾습니다. 분석 중에도 검색할 수 있고 결과는 계속 갱신됩니다.</div>
-    <div class="sumrow"><div id="summary"></div><span class="sumbtns"><button id="saveRes" class="hidden" title="찾은 쪽만 새 PDF로 저장">찾은 쪽 저장</button><button id="csvRes" class="hidden" title="파일·쪽·찾은 부분을 엑셀에서 열리는 CSV로 저장">엑셀로 저장</button><button id="copyRes" class="hidden" title="찾은 쪽 번호를 복사">결과 복사</button></span></div>
+    <div class="sumrow"><div id="summary" role="status"></div><span class="sumbtns"><button id="saveRes" class="hidden" title="찾은 쪽만 새 PDF로 저장">찾은 쪽 저장</button><button id="csvRes" class="hidden" title="파일·쪽·찾은 부분을 엑셀에서 열리는 CSV로 저장">엑셀로 저장</button><button id="copyRes" class="hidden" title="찾은 쪽 번호를 복사">결과 복사</button></span></div>
+    <div id="resTools" class="row hidden">
+      <label id="fFileWrap">파일 <select id="fFile"></select></label>
+      <label>순서 <select id="fSort"><option value="page">쪽 순서</option><option value="count">많이 나온 순</option></select></label>
+    </div>
     <div id="chips"></div>
     <div id="hits"></div>
   </div>
 </main>
 
-<dialog id="dlg">
+<dialog id="dlg" aria-labelledby="pvTitle">
   <div class="dlg-head">
     <strong id="pvTitle"></strong>
     <span class="pv-nav"><button id="pvPrev" title="이전 결과 (←)">◀ 이전</button><small id="pvPos"></small><button id="pvNext" title="다음 결과 (→)">다음 ▶</button></span>

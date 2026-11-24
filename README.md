@@ -36,6 +36,7 @@
 | `tools/make_glyphless.py` | 검색되는 PDF의 숨은 글자용 작은 글꼴(`models/glyphless.ttf`) 만들기 |
 | `tools/fold_affine.py` | 모델의 배율·더하기 층을 합성곱에 합치는 스크립트(결과 같고 더 빠름). `models/rec_small_int8.onnx`에 적용됨 |
 | `tests/regress.js` | 회귀 테스트: 네트워크를 막은 브라우저에서 쪽 찾기·위치 표시·결과 저장 확인 |
+| `tests/a11y.js` | 접근성 시험: axe-core로 주요 화면을 WCAG 2.2 AA 기준 점검(시험에만 씀) |
 | `tests/offline.js` | 오프라인 시험: 인터넷을 끊은 브라우저에서 모든 기능(분석·여러 파일·검색·미리보기·복사·쪽 저장·글자 저장·다시 불러오기, 그래픽카드 판독 포함)을 써 보고 바깥 요청이 0건인지 확인 |
 | `tests/bench.js` | 성능 측정: 시간, 키워드 적중률, 글자 정확도 |
 | `tests/gen_*.js`, `tests/fixtures/` | 시험용 스캔 PDF와 그 생성기 |
@@ -56,6 +57,10 @@ node tests/regress.js dist/pdf-page-finder.html
 
 ```bash
 node tests/offline.js dist/pdf-page-finder.html
+```
+
+```bash
+node tests/a11y.js dist/pdf-page-finder.html
 ```
 
 ```bash

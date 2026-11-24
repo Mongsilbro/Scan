@@ -83,6 +83,15 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
   const pos2 = await t.textContent('#pvPos'), title2 = await t.textContent('#pvTitle');
   check(/결과 1\//.test(pos1) && /결과 2\//.test(pos2), `미리보기에서 다음 결과로 넘기기: ${pos1} → ${pos2} (${title2})`);
   await t.click('#pvClose');
+  await t.fill('#q', '계약'); await t.waitForTimeout(400);
+  const allF = await t.$$eval('#chips .chips', e => e.map(x => x.textContent));
+  await t.selectOption('#fFile', { label: 'side.pdf' }); await t.waitForTimeout(300);
+  const oneF = await t.$$eval('#chips .chips', e => e.map(x => x.textContent));
+  check(allF.length === 2 && oneF.length === 1 && /side/.test(oneF[0]) && /^side\.pdf/.test(await t.textContent('#summary')), `파일 하나만 보기: ${allF.length}개 → ${oneF}`);
+  await t.selectOption('#fFile', ''); await t.selectOption('#fSort', 'count'); await t.waitForTimeout(300);
+  const cnt = await t.$$eval('#hits .hit small', e => e.map(x => parseInt(x.textContent)));
+  check(cnt.length > 1 && cnt.every((v, i) => !i || v <= cnt[i - 1]), `많이 나온 순: ${cnt}`);
+  await t.selectOption('#fSort', 'page');
   const [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc button:text("글자 저장")')]);
   const txt = require('fs').readFileSync(await dl.path(), 'utf8');
   check(/===== 2쪽 =====/.test(txt) && txt.length > 100, `인식된 글자 저장 (${txt.length}자)`);
@@ -168,6 +177,9 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
       await t2.close(); fs.unlinkSync(out);
     }
   }
+
+  console.log('사용법');
+  await t.goto(html); await t.click('.guide summary'); check(/검색되는 PDF/.test(await t.textContent('.guide')), '화면 안 사용법');
 
   console.log('네트워크');
   check(net === 0, `외부 접속 시도 ${net}건`);
