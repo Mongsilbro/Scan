@@ -59,6 +59,8 @@
   .hit-head button { font-weight: 700; padding: 3px 12px; }
   .hit-head small { color: var(--muted); }
   .snip { margin: 6px 0 0; font-size: .93rem; color: var(--muted); overflow-wrap: anywhere; }
+  .strip { display: block; width: 100%; height: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+  .strip-wait { min-height: 2.4em; }
   mark { background: var(--mark); color: var(--mark-ink); border-radius: 3px; padding: 0 2px; }
   dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--card); color: var(--ink); padding: 14px; max-width: min(96vw, 900px); }
   dialog::backdrop { background: rgba(0,0,0,.55); }
@@ -121,6 +123,7 @@
           <li>정확히 같은 것만: <code>"손해 배상"</code> · 그 말이 있는 쪽 빼기: <code>-계약기간</code></li>
           <li>글자가 조금 틀리게 인식된 비슷한 표현도 찾아 <code>3쪽 ?</code>처럼 따로 표시합니다.</li>
         </ul></li>
+      <li><b>찾은 곳 그림</b> — 결과마다 찾은 줄 둘레를 스캔 그림 그대로 보여 줍니다(표라면 같은 행의 금액까지). "찾은 곳 그림 보기"를 끄면 글자만 보입니다.</li>
       <li><b>미리보기</b> — 쪽 번호를 누르면 찾은 위치가 색 상자로 보입니다. ← → 다음 결과, PageUp/PageDown 앞뒤 쪽, + − 0 확대. <code>/</code> 키는 검색창으로.</li>
       <li><b>저장</b> — 결과 복사(쪽 번호) · 엑셀로 저장 · 찾은 쪽만 새 PDF로(구역별 ZIP 가능) · 검색되는 PDF(어느 PDF 보기 프로그램에서든 Ctrl+F로 찾기) · 인식된 글자(.txt).</li>
       <li><b>이전에 분석한 파일</b> — "이전에 분석한 파일 불러오기"로 원본 없이도 지난 결과에서 찾습니다.</li>
@@ -160,6 +163,7 @@
     <div id="resTools" class="row hidden">
       <label id="fFileWrap">파일 <select id="fFile"></select></label>
       <label>순서 <select id="fSort"><option value="page">쪽 순서</option><option value="count">많이 나온 순</option></select></label>
+      <label><input type="checkbox" id="fImg" checked> 찾은 곳 그림 보기</label>
     </div>
     <div id="chips"></div>
     <div id="hits"></div>

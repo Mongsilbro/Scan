@@ -35,6 +35,8 @@ async function run(label, args, query) {
   await t.fill('#q', '계약기간, 보증금'); await t.waitForTimeout(500);
   const heads = await t.$$eval('#hits .term-head', els => els.map(e => e.textContent));
   check(heads.length === 3 && !heads.slice(1).some(h => /없음/.test(h)), '여러 낱말·여러 파일 검색: ' + heads.slice(1).join(' | '));
+  await t.waitForSelector('#hits .hit').catch(() => {}); await t.$eval('#hits .hit', e => e.scrollIntoView()).catch(() => {}); await t.waitForSelector('#hits canvas.strip', { timeout: 10000 }).catch(() => {});
+  check((await t.$$('#hits canvas.strip')).length >= 2, '찾은 곳 그림');
   await t.click('#copyRes'); await t.waitForTimeout(200);
   check(/쪽/.test(await t.evaluate(() => navigator.clipboard.readText())), '결과 복사');
 

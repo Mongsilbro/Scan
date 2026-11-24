@@ -14,7 +14,7 @@ const AXE = fs.readFileSync(require.resolve('axe-core/axe.min.js'), 'utf8'); let
   await run('처음 화면'); await run('처음 화면', 'dark');
   await t.setInputFiles('#file', [path.join(__dirname, 'fixtures', 'scan.pdf'), path.join(__dirname, 'fixtures', 'side.pdf')]);
   await t.waitForFunction(() => { const s = [...document.querySelectorAll('#docs .doc small')]; return s.length === 2 && s.every(e => /완료/.test(e.textContent)); }, null, { timeout: 300000 });
-  await t.fill('#q', '계약, 보증금'); await t.waitForTimeout(400);
+  await t.fill('#q', '계약, 보증금'); await t.waitForSelector('#hits .hit').catch(() => {}); await t.$eval('#hits .hit', e => e.scrollIntoView()).catch(() => {}); await t.waitForSelector('#hits canvas.strip', { timeout: 10000 }); await t.waitForTimeout(400);
   await run('검색 결과'); await run('검색 결과', 'dark');
   await (await t.$('#hits .chip')).click(); await t.waitForTimeout(1200); await run('미리보기');
   await t.click('#pvClose'); await t.click('#saveRes'); await t.waitForTimeout(300); await run('쪽 저장 창');

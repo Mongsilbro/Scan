@@ -1060,7 +1060,65 @@
       div.appendChild(snip);
     }
     if (spans.length > 3) { const more = document.createElement('p'); more.className = 'snip'; more.textContent = `외 ${spans.length - 3}건`; div.appendChild(more); }
+    if (d.pdf && $('fImg').checked) stripFor(div, d, p, t, fuzzy);
     return div;
+  }
+
+  // ---------- 찾은 곳 그림: 결과 목록에서 찾은 줄 둘레를 스캔 그림 그대로 보여 줌 (표라면 같은 행의 금액까지 보임) ----------
+  // 화면에 보일 때만 그림. 그린 쪽은 최근 4쪽만, 잘라 낸 그림은 최근 30개만 둠
+  const STRIP = { pages: [], cuts: new Map(), io: null };
+  function stripPage(d, n) {
+    let e = STRIP.pages.find(x => x.d === d && x.n === n);
+    if (!e) {
+      e = { d, n, p: d.pdf.getPage(n).then(pg => renderToCanvas(pg, 2, 2000)) };
+      STRIP.pages.unshift(e);
+      for (const old of STRIP.pages.splice(4)) old.p.then(c => { c.width = c.height = 0; }, () => {});
+    } else { STRIP.pages.splice(STRIP.pages.indexOf(e), 1); STRIP.pages.unshift(e); }
+    return e.p;
+  }
+  // 찾은 상자들을 줄 단위 띠로 묶음 (위아래로 겹치거나 가까우면 한 띠). 최대 2개
+  function stripBands(rs) {
+    const bands = [];
+    for (const r of rs.slice().sort((a, b) => a[1] - b[1])) {
+      const h = r[3] - r[1], last = bands[bands.length - 1];
+      if (last && r[1] <= last.y1 + h * 0.5) { last.y1 = Math.max(last.y1, r[3]); last.h = Math.max(last.h, h); last.rs.push(r); }
+      else bands.push({ y0: r[1], y1: r[3], h, rs: [r] });
+    }
+    return bands.slice(0, 2);
+  }
+  async function drawStrip(box, d, p, t) {
+    const key = `${d.name}|${d.file ? d.file.size : 0}|${p.n}|${p.layers.length}|${t}`;
+    let cut = STRIP.cuts.get(key);
+    if (!cut) {
+      if (p.layers.some(L => (L.boxes || []).some(b => b[6] === 90 || b[6] === 270))) return;    // 옆으로 누운 쪽은 미리보기로
+      const bands = stripBands(locate(p, t)); if (!bands.length) return;
+      const pc = await stripPage(d, p.n); if (!pc.width) return;
+      const W = pc.width, H = pc.height;
+      cut = bands.map(b => {
+        const m = Math.max(b.h * 1.7, 0.015), y0 = Math.max(0, b.y0 - m), y1 = Math.min(1, b.y1 + m);
+        const c = document.createElement('canvas'); c.className = 'strip'; c.width = W; c.height = Math.max(8, Math.round((y1 - y0) * H));
+        const x = c.getContext('2d'); x.drawImage(pc, 0, Math.round(y0 * H), W, c.height, 0, 0, W, c.height);
+        x.fillStyle = 'rgba(255, 214, 0, 0.35)'; x.strokeStyle = 'rgba(230, 120, 0, 0.95)'; x.lineWidth = 3;
+        for (const [a, b0, z, b1] of b.rs) { const rx = a * W - 3, ry = (b0 - y0) * H - 3, rw = (z - a) * W + 6, rh = (b1 - b0) * H + 6; x.fillRect(rx, ry, rw, rh); x.strokeRect(rx, ry, rw, rh); }
+        c.setAttribute('role', 'img'); c.setAttribute('aria-label', `${p.n}쪽에서 "${t}" 을(를) 찾은 곳 그림`);
+        c.title = '누르면 이 쪽 미리보기';
+        return c;
+      });
+      STRIP.cuts.set(key, cut);
+      for (const k of [...STRIP.cuts.keys()].slice(0, Math.max(0, STRIP.cuts.size - 30))) STRIP.cuts.delete(k);
+    }
+    if (!box.isConnected) return;
+    box.classList.remove('strip-wait'); box.replaceChildren(...cut);
+  }
+  function stripFor(div, d, p, t) {
+    const box = document.createElement('div'); box.className = 'strip-wait';
+    box.onclick = () => { const b = div.querySelector('.hit-head button'); if (b) b.click(); };
+    div.appendChild(box);
+    const key = `${d.name}|${d.file ? d.file.size : 0}|${p.n}|${p.layers.length}|${t}`;
+    if (STRIP.cuts.has(key)) { box.classList.remove('strip-wait'); box.replaceChildren(...STRIP.cuts.get(key)); return; }   // 다시 찾을 때 깜빡이지 않게
+    if (!STRIP.io) STRIP.io = new IntersectionObserver(es => { for (const e of es) if (e.isIntersecting) { STRIP.io.unobserve(e.target); e.target.__go(); } }, { rootMargin: '400px' });
+    box.__go = () => drawStrip(box, d, p, t).catch(e => console.warn('찾은 곳 그림 실패', e)).finally(() => box.classList.remove('strip-wait'));
+    STRIP.io.observe(box);
   }
 
   // 쪽 안에서 검색어 위치 찾기: 위치 정보가 있는 판독 결과에서 정확히 → 비슷하게 순서로 찾고, 글줄 상자 안에서 글자 비율로 범위를 좁힘
@@ -1216,7 +1274,7 @@
   $('go').onclick = () => { search(); remember(); };
   // 설정과 최근 검색어를 이 브라우저에 기억(없거나 막혀 있으면 그냥 넘어감)
   const store = { get: k => { try { return JSON.parse(localStorage.getItem('ppf.' + k)); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem('ppf.' + k, JSON.stringify(v)); } catch (e) {} } };
-  for (const id of ['fine', 'fuzzy', 'force']) { const v = store.get(id); if (typeof v === 'boolean') $(id).checked = v; $(id).addEventListener('change', () => store.set(id, $(id).checked)); }
+  for (const id of ['fine', 'fuzzy', 'force', 'fImg']) { const v = store.get(id); if (typeof v === 'boolean') $(id).checked = v; $(id).addEventListener('change', () => store.set(id, $(id).checked)); }
   const dl = document.createElement('datalist'); dl.id = 'recentQ'; document.body.appendChild(dl); qEl.setAttribute('list', 'recentQ');
   const showRecent = () => { dl.innerHTML = ''; for (const r of store.get('recent') || []) { const o = document.createElement('option'); o.value = r; dl.appendChild(o); } };
   function remember() {
@@ -1226,6 +1284,7 @@
   showRecent();
   $('fuzzy').onchange = search;
   $('fFile').onchange = $('fSort').onchange = search;
+  $('fImg').onchange = search;
   let typing = null;
   qEl.oninput = () => { clearTimeout(typing); typing = setTimeout(search, 150); };
   qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); remember(); } };

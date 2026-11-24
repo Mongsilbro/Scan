@@ -92,6 +92,17 @@ const check = (ok, msg) => { console.log((ok ? '  ✓ ' : '  ✗ ') + msg); if (
   const cnt = await t.$$eval('#hits .hit small', e => e.map(x => parseInt(x.textContent)));
   check(cnt.length > 1 && cnt.every((v, i) => !i || v <= cnt[i - 1]), `많이 나온 순: ${cnt}`);
   await t.selectOption('#fSort', 'page');
+  // 찾은 곳 그림: 결과마다 찾은 줄 둘레를 그림으로, 누르면 미리보기, 끄면 사라짐
+  await t.fill('#q', '손해 배상'); await t.waitForFunction(() => /"손해 배상"/.test(document.getElementById('summary').textContent)); await t.waitForSelector('#hits .hit').catch(() => {}); await t.$eval('#hits .hit', e => e.scrollIntoView()).catch(() => {}); await t.waitForSelector('#hits canvas.strip', { timeout: 10000 }).catch(() => {});
+  const strips = await t.$$eval('#hits canvas.strip', e => e.map(c => [c.width, c.height]));
+  const yellow = await t.$eval('#hits canvas.strip', c => { const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data; let n = 0; for (let i = 0; i < px.length; i += 4) if (px[i] > 200 && px[i + 1] > 150 && px[i + 2] < 120) n++; return n; }).catch(() => 0);
+  check(strips.length >= 1 && strips[0][1] > 20 && strips[0][1] < strips[0][0] / 3 && yellow > 50, `찾은 곳 그림: ${strips.map(s => s.join('x'))} (노란 표시 ${yellow}점)`);
+  await t.click('#hits canvas.strip'); await t.waitForTimeout(1200);
+  check(await t.$eval('#dlg', x => x.open) && /노란 상자/.test(await t.textContent('#pvNote')), '찾은 곳 그림을 누르면 미리보기');
+  await t.click('#pvClose');
+  await t.uncheck('#fImg'); await t.waitForTimeout(300);
+  check(!(await t.$$('#hits canvas.strip')).length, '"찾은 곳 그림 보기"를 끄면 글자만');
+  await t.check('#fImg');
   const [dl] = await Promise.all([t.waitForEvent('download'), t.click('#docs .doc button:text("글자 저장")')]);
   const txt = require('fs').readFileSync(await dl.path(), 'utf8');
   check(/===== 2쪽 =====/.test(txt) && txt.length > 100, `인식된 글자 저장 (${txt.length}자)`);
