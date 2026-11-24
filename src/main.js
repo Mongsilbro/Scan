@@ -921,6 +921,44 @@
   }
 
   // 한 파일에서 한 낱말을 찾음 → [{ p, L, spans, fuzzy }]
+  // 1차(Tesseract) 잡티 걸러내기: 영어 문단을 한국어 모델이 숫자 투성이로 잘못 읽는 일이 있음(예: "34 60035 30 134").
+  // 같은 자리의 신경망 글줄이 글자(한글·영문)인데 1차 글줄만 숫자 투성이면 그 1차 글줄은 검색에서 뺌. 신경망 글줄은 그대로 찾으므로 진짜 글자는 놓치지 않음
+  const JUNK = Q.get('junk') !== '0';
+  function junkOf(p) {
+    if (!JUNK || p.src !== 'ocr' || p.layers.length < 2) return null;
+    const N = p.layers[0], T = p.layers[1];
+    if (p.__junk && p.__junk.N === N) return p.__junk.r;
+    let r = null;
+    if (N.boxes && N.boxes.length && T.boxes && T.boxes.length && !N.boxes.some(b => b[6])) {
+      r = [];
+      const cnt = (t, re) => (t.match(re) || []).length;
+      for (const [s, e, x0, y0, x1, y1] of T.boxes) {
+        // 한 줄 안에서 한글이 없는 낱말이 이어진 묶음(영어 잡티 후보). 한국어 부분은 건드리지 않음
+        const t = T.text.slice(s, e), runs = []; let cur = null;
+        for (const m of t.matchAll(/\S+/g)) {
+          if (/[가-힣]/.test(m[0])) { cur = null; continue; }
+          if (!cur) runs.push(cur = { a: m.index, z: 0, dg: 0 });
+          cur.z = m.index + m[0].length; cur.dg += cnt(m[0], /\d/g);
+        }
+        const dg = runs.reduce((n, r) => n + r.dg, 0); if (dg < 3) continue;
+        let nt = '';
+        for (const [ns, ne, a0, b0, a1, b1] of N.boxes) {
+          const vo = Math.min(y1, b1) - Math.max(y0, b0), ho = Math.min(x1, a1) - Math.max(x0, a0);
+          if (ho > 0 && vo > 0.5 * Math.min(y1 - y0, b1 - b0)) nt += N.text.slice(ns, ne);
+        }
+        // 같은 자리를 신경망은 영문 글자로 읽었고 숫자는 거의 없음 → 1차의 숫자 투성이 묶음은 잡티
+        const nd = cnt(nt, /\d/g), nlat = cnt(nt, /[A-Za-z]/g);
+        if (nlat >= 6 && nd <= dg * 0.25) for (const x of runs) if (x.dg) r.push([s + x.a, s + x.z]);
+      }
+      if (Q.get('debug') && r.length) console.log(`p${p.n} 1차 잡티 글줄 ${r.length}개:`, r.map(([s, e]) => T.text.slice(s, e)).join(' | '));
+      if (!r.length) r = null;
+    }
+    p.__junk = { N, r };
+    return r;
+  }
+  // 잡티 글줄 안에만 있는 찾은 곳은 뺌
+  const dropJunk = (p, L, spans) => { const J = L === p.layers[1] && junkOf(p); return J ? spans.filter(([s, e]) => !J.some(([a, b]) => s >= a && e <= b)) : spans; };
+
   function findIn(doc, raw, k) {
     const q = normalize(raw).out, qj = normalize(raw, true).out, found = [];
     if (!q) return found;
@@ -928,14 +966,15 @@
     for (const p of doc.pages.filter(Boolean)) {
       let hit = null;
       for (const L of p.layers) {
-        const spans = []; let i = L.out.indexOf(q);
+        let spans = []; let i = L.out.indexOf(q);
         while (i !== -1) { spans.push([L.map[i], L.map[i + q.length - 1] + 1]); i = L.out.indexOf(q, i + q.length); }
+        spans = dropJunk(p, L, spans);
         if (spans.length) { hit = { p, L, spans, fuzzy: false }; break; }
       }
       if (!hit && k > 0) for (const L of p.layers) {
         if (!L.j) L.j = normalize(L.text, true);
-        const hs = fuzzyFind(L.j.out, qj, k);
-        if (hs.length) { hit = { p, L, fuzzy: true, spans: hs.map(h => [L.j.map[h.s], L.j.map[h.e - 1] + 1]) }; break; }
+        const spans = dropJunk(p, L, fuzzyFind(L.j.out, qj, k).map(h => [L.j.map[h.s], L.j.map[h.e - 1] + 1]));
+        if (spans.length) { hit = { p, L, fuzzy: true, spans }; break; }
       }
       if (hit) found.push(hit);
     }
@@ -1137,15 +1176,16 @@
     };
     const withBoxes = p.layers.filter(L => L.boxes && L.boxes.length);
     for (const L of withBoxes) {
-      const spans = []; let i = L.out.indexOf(q);
+      let spans = []; let i = L.out.indexOf(q);
       while (i !== -1) { spans.push([L.map[i], L.map[i + q.length - 1] + 1]); i = L.out.indexOf(q, i + q.length); }
+      spans = dropJunk(p, L, spans);
       if (spans.length) return rects(L, spans);
     }
     const k = Math.max(1, tolerance(qj.length));
     for (const L of withBoxes) {
       if (!L.j) L.j = normalize(L.text, true);
-      const hs = fuzzyFind(L.j.out, qj, k);
-      if (hs.length) return rects(L, hs.map(h => [L.j.map[h.s], L.j.map[h.e - 1] + 1]));
+      const spans = dropJunk(p, L, fuzzyFind(L.j.out, qj, k).map(h => [L.j.map[h.s], L.j.map[h.e - 1] + 1]));
+      if (spans.length) return rects(L, spans);
     }
     return [];
   }
