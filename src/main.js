@@ -2,7 +2,11 @@
   const $ = id => document.getElementById(id);
   const drop = $('drop'), fileInput = $('file'), bar = $('bar'), statusEl = $('status');
   const qEl = $('q'), hitsEl = $('hits'), chipsEl = $('chips'), summaryEl = $('summary');
-  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; }
+  $('pv').setAttribute('role', 'img'); $('pv').setAttribute('aria-label', '쪽 그림');
+  const announcer = document.createElement('div'); announcer.className = 'sr-only'; announcer.setAttribute('role', 'status'); document.body.appendChild(announcer);
+  function setStatus(msg, cls) { statusEl.textContent = msg; statusEl.className = cls || ''; if (cls) announcer.textContent = msg; }   // 완료·오류만 화면 읽기 프로그램에 알림
+  let early = null;                     // 준비가 끝나기 전에 고른 파일은 기억했다가 준비되면 분석
+  fileInput.onchange = () => { early = [...fileInput.files]; };
   const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   // ---------- 내장 자원 ----------
@@ -20,7 +24,9 @@
   // ---------- 설정 (주소 뒤에 ?dpi=250&workers=2 처럼 붙여 조정 가능) ----------
   const Q = new URLSearchParams(location.search);
   const cores = navigator.hardwareConcurrency || 4;
-  let autoWorkers = Math.max(1, Math.min(8, cores));   // 코어가 많은 컴퓨터는 최대 8개까지 동시 처리
+  // 동시 처리 수: 8코어까지는 코어 수만큼. 코어가 더 많고 메모리가 8GB 이상이면 화면 쪽 일·브라우저 몫으로 4개를 남기고 최대 16개
+  let autoWorkers = Math.max(1, Math.min(8, cores));
+  if (cores > 8 && (navigator.deviceMemory || 8) >= 8) autoWorkers = Math.min(16, Math.max(8, cores - 4));
   if (navigator.deviceMemory && navigator.deviceMemory <= 4) autoWorkers = Math.min(autoWorkers, 2);
   const CFG = {
     dpi: +Q.get('dpi') || 200,
@@ -37,6 +43,13 @@
     table: Q.get('table') !== '0',        // 표 칸 단위 인식
     psmc: Q.get('psmc') || '6',           // 표 칸을 읽을 때의 방식
     rot: Q.get('rot') === '1',            // 기울기 자동 보정
+    chunk: +Q.get('chunk') || 8,          // 2차 판독에서 작업자에게 한 번에 넘기는 글줄 수
+    ahead: Q.has('ahead') ? +Q.get('ahead') : 1,   // 2차에서 신경망 작업자 수보다 몇 쪽 더 미리 준비할지
+    overlap: Q.get('overlap') !== '0',    // 1차 판독이 끝난 작업자부터 바로 2차 판독 시작
+    warm: Q.get('warm') !== '0',          // 페이지를 열 때 판독 엔진 미리 준비
+    prepw: Q.get('prepw') !== '0',        // 전처리·표/글줄 찾기·글줄 자르기를 준비 작업자에게 맡김
+    gpu: Q.get('gpu') || 'auto',          // 그래픽카드(WebGPU) 판독: auto(인텔 내장 그래픽은 안 씀) | 1(내장 그래픽도 사용) | 0(끄기) | force(느려도·소프트웨어 그래픽이어도 사용, 시험용)
+    gpuBatch: +Q.get('gpuBatch') || 16,   // 그래픽카드 작업자가 한 번에 가져가는 최대 글줄 수
     maxPx: 3800
   };
 
@@ -59,6 +72,8 @@
 
   let analyzedLang = '';
   let pdf = null, curFile = null, pages = [], total = 0, runId = 0, running = false;
+  // 여러 파일: 차례로 분석하고, 검색은 모든 파일에서. 파일마다 { file, name, pdf, pages, total, state: wait|run|done|stop|err, note }
+  const docs = [], queue = []; let curDoc = null;
 
   // ---------- 글자 정규화 ----------
   // 공백 제거 + 소문자화. map[i] = 정규화된 i번째 글자의 원문 위치
@@ -111,65 +126,54 @@
     await page.render({ canvasContext: ctx, viewport: vp }).promise;
     return canvas;
   }
-  // 흑백 변환 + 배경(종이색)을 흰색으로, 글자를 검게 늘려 대비를 높임
-  function enhance(canvas) {
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const im = ctx.getImageData(0, 0, canvas.width, canvas.height), d = im.data;
-    const hist = new Uint32Array(256); const n = d.length / 4;
-    for (let i = 0; i < d.length; i += 4) { const g = (d[i] * 77 + d[i + 1] * 150 + d[i + 2] * 29) >> 8; d[i] = g; hist[g]++; }
-    let lo = 0, hi = 255, acc = 0;
-    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.005) { lo = v; break; } }
-    acc = 0;
-    for (let v = 0; v < 256; v++) { acc += hist[v]; if (acc >= n * 0.5) { hi = v; break; } }
-    hi = Math.max(lo + 1, hi - 6);
-    const ok = hi - lo >= 50;          // 대비가 거의 없는 쪽(빈 쪽, 어두운 바탕)은 흑백 변환만
-    const lut = new Uint8ClampedArray(256);
-    for (let v = 0; v < 256; v++) lut[v] = ok ? (v - lo) * 255 / (hi - lo) : v;
-    for (let i = 0; i < d.length; i += 4) { const g = lut[d[i]]; d[i] = d[i + 1] = d[i + 2] = g; }
-    ctx.putImageData(im, 0, 0);
+  const IP = makeImgProc(CFG, () => document.createElement('canvas'), { line: (g, wout, flip, lineCv) => {
+    if (Q.get('dumpg') && !flip) (window.__g = window.__g || []).push({ w: wout, g: g.slice() });   // 시험용: 신경망에 넣은 글줄 그림 저장
+    if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
+  } });
+  const { enhance, rotated, linesAreVertical, segment, tableImages } = IP;
+  const OUT = { text: true, blocks: false, hocr: false, tsv: true };   // tsv: 낱말 위치 (미리보기 노란 상자·검색되는 PDF 에 씀)
+  // Tesseract TSV → 글줄 [{ t, x0, y0, x1, y1 }] (그림 픽셀 좌표)
+  function tsvLines(tsv) {
+    const lines = new Map();
+    for (const row of (tsv || '').split('\n')) {
+      const c = row.split('\t'); if (c[0] !== '5' || c.length < 12) continue;
+      const t = c.slice(11).join('\t').trim(); if (!t) continue;
+      const k = c[2] + '.' + c[3] + '.' + c[4], x = +c[6], y = +c[7], x1 = x + +c[8], y1 = y + +c[9];
+      const L = lines.get(k); if (!L) lines.set(k, { t, x0: x, y0: y, x1, y1 });
+      else { L.t += ' ' + t; L.x0 = Math.min(L.x0, x); L.y0 = Math.min(L.y0, y); L.x1 = Math.max(L.x1, x1); L.y1 = Math.max(L.y1, y1); }
+    }
+    return [...lines.values()];
   }
-  function rotated(canvas, deg) {
-    const c = document.createElement('canvas'); const q = deg % 180 !== 0;
-    c.width = q ? canvas.height : canvas.width; c.height = q ? canvas.width : canvas.height;
-    const ctx = c.getContext('2d');
-    ctx.translate(c.width / 2, c.height / 2); ctx.rotate(deg * Math.PI / 180);
-    ctx.drawImage(canvas, -canvas.width / 2, -canvas.height / 2);
-    return c;
+  // 그림을 압축 없는 회색 PGM 으로 넘김: 캔버스를 넘기면 PNG 로 압축(화면 쪽)하고 작업자가 다시 푸느라 시간이 듦. 픽셀은 같음
+  // 그림은 캔버스이거나, 준비 작업자가 보낸 회색 값 { width, height, gray, vertical }
+  function toPGM(img) {
+    const W = img.width, H = img.height, head = new TextEncoder().encode(`P5\n${W} ${H}\n255\n`);
+    if (img.gray) return new Blob([head, img.gray]);
+    const d = img.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data, out = new Uint8Array(W * H);
+    for (let i = 0; i < out.length; i++) out[i] = d[i * 4];
+    return new Blob([head, out]);
   }
-  // 글줄 방향 추정: 가로줄이면 행 방향 농도 변화가 크고, 옆으로 누운 스캔이면 열 방향 변화가 큼
-  function linesAreVertical(canvas) {
-    const s = 600 / Math.max(canvas.width, canvas.height);
-    const w = Math.max(8, Math.round(canvas.width * s)), h = Math.max(8, Math.round(canvas.height * s));
-    const c = document.createElement('canvas'); c.width = w; c.height = h;
-    const ctx = c.getContext('2d', { willReadFrequently: true }); ctx.drawImage(canvas, 0, 0, w, h);
-    const d = ctx.getImageData(0, 0, w, h).data;
-    let sum = 0; for (let i = 0; i < d.length; i += 4) sum += d[i];
-    const thr = sum / (w * h) * 0.8;
-    const rows = new Float32Array(h), cols = new Float32Array(w);
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (d[(y * w + x) * 4] < thr) { rows[y]++; cols[x]++; }
-    const rough = (a, norm) => { let r = 0; for (let i = 1; i < a.length; i++) { const v = (a[i] - a[i - 1]) / norm; r += v * v; } return r / a.length; };
-    const rr = rough(rows, w), rc = rough(cols, h);
-    return rc > rr * 2.5 && rc > 1e-5;
-  }
-  const OUT = { text: true, blocks: false, hocr: false, tsv: false };
-  async function recog(w, canvas, deg) {
-    const c = deg ? rotated(canvas, deg) : canvas;
-    const r = (await w.recognize(c, { rotateAuto: CFG.rot }, OUT)).data;
+  const asCanvas = img => img.gray ? (img.cv || (img.cv = IP.canvasOf(img))) : img;
+  const free = img => { if (img.gray) { if (img.cv) img.cv.width = img.cv.height = 0; img.gray = img.cv = null; } else img.width = img.height = 0; };
+  async function recog(w, img, deg) {
+    const c = deg ? rotated(asCanvas(img), deg) : img;
+    const r = (await w.recognize(toPGM(c), { rotateAuto: CFG.rot }, OUT)).data;
     if (deg) c.width = c.height = 0;
     const text = r.text || '', conf = r.confidence || 0;
     // 품질 점수: 신뢰도 × 제대로 된 글자(한글 음절·영문자) 비율. 뒤집힌 글자는 숫자·기호로 읽혀 점수가 낮아짐
     const body = text.replace(/\s/g, ''), letters = (body.match(/[가-힣A-Za-z]/g) || []).length;
     const ratio = body.length ? letters / body.length : 0;
     if (Q.get('debug')) console.log('recog', deg, 'conf', conf, 'ratio', ratio.toFixed(2), 'len', body.length, JSON.stringify(text.slice(0, 60)));
-    return { text, conf, deg, ratio, len: body.length, score: conf * (0.2 + ratio) };
+    return { text, conf, deg, ratio, len: body.length, score: conf * (0.2 + ratio), lines: deg ? null : tsvLines(r.tsv) };
   }
   // 반환: { text, deg } — deg 는 글자가 바로 서는 회전 각도
   async function ocrCanvas(w, canvas, knownDeg) {
     if (knownDeg !== undefined) return recog(w, canvas, knownDeg);
     const better = (a, b) => (b.score > a.score * 1.1 ? b : a);
     let best;
-    if (Q.get('debug')) console.log('linesAreVertical', linesAreVertical(canvas));
-    if (linesAreVertical(canvas)) {          // 옆으로 누운 쪽: 두 방향을 모두 읽어 더 잘 읽힌 쪽 선택
+    const vertical = canvas.vertical !== undefined ? canvas.vertical : linesAreVertical(asCanvas(canvas));
+    if (Q.get('debug')) console.log('linesAreVertical', vertical);
+    if (vertical) {          // 옆으로 누운 쪽: 두 방향을 모두 읽어 더 잘 읽힌 쪽 선택
       // 방향 판별은 한 덩어리 방식이 안정적이라 그 방식으로 먼저 가늠한 뒤, 정해진 방향으로 본 판독
       const psm = w.__psm; await setPsm(w, '6');
       const r90 = await recog(w, canvas, 90), r270 = await recog(w, canvas, 270), probe = r270.score > r90.score ? r270 : r90;
@@ -188,332 +192,187 @@
     return best;
   }
 
-  // ---------- 표 인식 ----------
-  // 잡티 제거 → 표 선 찾아 지우기 → 선으로 둘러싸인 칸 찾기. canvas 를 그 자리에서 정리하고 칸 목록을 돌려줌
-  function segment(canvas, dpi) {
-    const W = canvas.width, H = canvas.height, N = W * H, sc = dpi / 200;
-    const ctx = canvas.getContext('2d', { willReadFrequently: true });
-    const im = ctx.getImageData(0, 0, W, H), d = im.data;
-    // Otsu 2값화
-    const hist = new Uint32Array(256);
-    for (let p = 0; p < N; p++) hist[d[p * 4]]++;
-    let sum = 0; for (let v = 0; v < 256; v++) sum += v * hist[v];
-    let sumB = 0, wB = 0, best = 0, thr = 128;
-    for (let v = 0; v < 256; v++) {
-      wB += hist[v]; if (!wB) continue; const wF = N - wB; if (!wF) break;
-      sumB += v * hist[v]; const diff = sumB / wB - (sum - sumB) / wF, between = wB * wF * diff * diff;
-      if (between > best) { best = between; thr = v; }
-    }
-    const bin = new Uint8Array(N); let ink = 0;
-    for (let p = 0; p < N; p++) if (d[p * 4] <= thr) { bin[p] = 1; ink++; }
-    if (ink > N * 0.5 || ink < 50) return null;       // 어두운 바탕이거나 빈 쪽
-    const erase = p => { bin[p] = 0; const i = p * 4; d[i] = d[i + 1] = d[i + 2] = 255; };
-
-    // 1) 잡티 제거: 가로·세로 모두 아주 작은 점 덩어리
-    const maxDim = Math.max(2, Math.round(3 * sc)), cap = maxDim * maxDim + 1;
-    const seen = new Uint8Array(N), stack = new Int32Array(N), keep = new Int32Array(cap), hs = [];
-    for (let p0 = 0; p0 < N; p0++) {
-      if (!bin[p0] || seen[p0]) continue;
-      let sp = 0, cnt = 0, x0 = W, x1 = 0, y0 = H, y1 = 0; stack[sp++] = p0; seen[p0] = 1;
-      while (sp) {
-        const p = stack[--sp], x = p % W, y = (p - x) / W;
-        if (cnt < cap) keep[cnt] = p; cnt++;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= H) continue;
-          for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= W) continue;
-            const q = yy * W + xx; if (bin[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; } } }
-      }
-      if (x1 - x0 < maxDim && y1 - y0 < maxDim && cnt < cap) for (let k = 0; k < cnt; k++) erase(keep[k]);
-      else { const bh = y1 - y0 + 1; if (bh >= 6 * sc && bh <= 120 * sc && x1 - x0 <= 160 * sc) hs.push(bh); }
-    }
-
-    // 2) 표 선: 길게 이어진 가로·세로 줄 (기울어진 선도 잡도록 이웃 1픽셀까지 함께 봄)
-    const line = new Uint8Array(N), minRun = Math.round(80 * sc); let linePx = 0;
-    for (let y = 1; y < H - 1; y++) { const o = y * W; let run = 0;
-      for (let x = 0; x <= W; x++) {
-        if (x < W && (bin[o + x] | bin[o + x - W] | bin[o + x + W])) { run++; continue; }
-        if (run >= minRun) { linePx += run; for (let k = x - run; k < x; k++) { line[o + k] |= 1; line[o + k - W] |= 1; line[o + k + W] |= 1; } }
-        run = 0;
-      } }
-    for (let x = 1; x < W - 1; x++) { let run = 0;
-      for (let y = 0; y <= H; y++) { const p = y * W + x;
-        if (y < H && (bin[p] | bin[p - 1] | bin[p + 1])) { run++; continue; }
-        if (run >= minRun) { linePx += run; for (let k = y - run; k < y; k++) { const q = k * W + x; line[q] |= 2; line[q - 1] |= 2; line[q + 1] |= 2; } }
-        run = 0;
-      } }
-    const cells = [];
-    const G = 4, gw = Math.ceil(W / G), gh = Math.ceil(H / G);
-    const label = new Int32Array(gw * gh);
-    if (linePx >= minRun * 8) {
-      // 3) 격자(4픽셀 단위)에서 선을 벽으로 삼아 칸을 찾음. 끊어진 선은 이어 붙임
-      const hm = new Uint8Array(gw * gh), vm = new Uint8Array(gw * gh);
-      for (let p = 0; p < N; p++) { const l = line[p]; if (!l) continue;
-        if (bin[p]) erase(p);
-        const x = p % W, g = ((p - x) / W / G | 0) * gw + (x / G | 0);
-        if (l & 1) hm[g] = 1; if (l & 2) vm[g] = 1; }
-      const gap = Math.round(12 * sc), ext = 2;
-      for (let y = 0; y < gh; y++) { let last = -1; const o = y * gw;
-        for (let x = 0; x < gw; x++) if (hm[o + x] === 1) { if (last >= 0 && x - last - 1 <= gap) for (let k = last + 1; k < x; k++) hm[o + k] = 2; last = x; }
-        for (let x = 0; x < gw; x++) if (hm[o + x] && hm[o + x] < 3) for (let k = Math.max(0, x - ext); k <= Math.min(gw - 1, x + ext); k++) if (!hm[o + k]) hm[o + k] = 3; }
-      for (let x = 0; x < gw; x++) { let last = -1;
-        for (let y = 0; y < gh; y++) if (vm[y * gw + x] === 1) { if (last >= 0 && y - last - 1 <= gap) for (let k = last + 1; k < y; k++) vm[k * gw + x] = 2; last = y; }
-        for (let y = 0; y < gh; y++) { const v = vm[y * gw + x]; if (v && v < 3) for (let k = Math.max(0, y - ext); k <= Math.min(gh - 1, y + ext); k++) if (!vm[k * gw + x]) vm[k * gw + x] = 3; } }
-      for (let g = 0; g < gw * gh; g++) if (hm[g] || vm[g]) label[g] = -1;
-      const queue = new Int32Array(gw * gh); let id = 0;
-      for (let g0 = 0; g0 < gw * gh; g0++) {
-        if (label[g0]) continue;
-        id++; let qh = 0, qt = 0, cnt = 0, x0 = gw, x1 = 0, y0 = gh, y1 = 0; queue[qt++] = g0; label[g0] = id;
-        while (qh < qt) {
-          const g = queue[qh++], x = g % gw, y = (g - x) / gw; cnt++;
-          if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-          if (x > 0 && !label[g - 1]) { label[g - 1] = id; queue[qt++] = g - 1; }
-          if (x < gw - 1 && !label[g + 1]) { label[g + 1] = id; queue[qt++] = g + 1; }
-          if (y > 0 && !label[g - gw]) { label[g - gw] = id; queue[qt++] = g - gw; }
-          if (y < gh - 1 && !label[g + gw]) { label[g + gw] = id; queue[qt++] = g + gw; }
-        }
-        const bw = x1 - x0 + 1, bh = y1 - y0 + 1, area = bw * bh;
-        if (area <= gw * gh * 0.5 && cnt / area >= 0.6 && bw * G >= 30 * sc && bh * G >= 20 * sc)
-          cells.push({ id, x0: x0 * G, y0: y0 * G, x1: Math.min(W, (x1 + 1) * G), y1: Math.min(H, (y1 + 1) * G) });
-      }
-      // 칸 안에서 글자가 있는 범위
-      const isCell = new Uint8Array(id + 1);
-      for (const c of cells) {
-        let ax0 = W, ax1 = -1, ay0 = H, ay1 = -1, n = 0;
-        for (let y = c.y0; y < c.y1; y++) { const go = (y / G | 0) * gw, o = y * W;
-          for (let x = c.x0; x < c.x1; x++) if (bin[o + x] && label[go + (x / G | 0)] === c.id) {
-            n++; if (x < ax0) ax0 = x; if (x > ax1) ax1 = x; if (y < ay0) ay0 = y; if (y > ay1) ay1 = y; } }
-        c.ink = n; c.ax0 = ax0; c.ax1 = ax1; c.ay0 = ay0; c.ay1 = ay1;
-      }
-      const useful = cells.filter(c => c.ink >= 12 * sc * sc);
-      cells.length = 0;
-      if (useful.length >= 4) {       // 글자가 든 칸이 넷 이상일 때만 표로 취급
-        const tol = 28 * sc;
-        useful.sort((a, b) => a.y0 - b.y0);
-        let row = [], top = -1e9;
-        const flush = () => { row.sort((a, b) => a.x0 - b.x0); for (const c of row) cells.push(c); row = []; };
-        for (const c of useful) { if (c.y0 - top > tol) { flush(); top = c.y0; } row.push(c); }
-        flush();
-        for (const c of cells) isCell[c.id] = 1;
-      }
-      var cellMask = isCell;
-    }
-    ctx.putImageData(im, 0, 0);
-    hs.sort((a, b) => a - b);
-    const hchar = hs.length ? hs[Math.floor(hs.length * 0.7)] : 24 * sc;      // 대표 글자 높이
-    return { cells, d, bin, label, isCell: cellMask, W, H, G, gw, gh, sc, line, hchar };
-  }
-
-  // 칸들을 세로로 이어 붙인 그림(들)과, 칸 밖 글자만 남긴 그림을 만듦
-  function tableImages(seg) {
-    const { cells, d, bin, label, isCell, W, H, G, gw, sc } = seg;
-    const pad = Math.round(14 * sc), gapY = Math.round(34 * sc), maxH = Math.round(5200 * sc);
-    const strips = []; let cur = null;
-    const stripW = Math.max(...cells.map(c => c.ax1 - c.ax0 + 1)) + pad * 2;
-    for (const c of cells) {
-      const h = c.ay1 - c.ay0 + 1;
-      if (!cur || cur.h + h + gapY > maxH) { cur = { items: [], h: pad }; strips.push(cur); }
-      cur.items.push({ c, y: cur.h }); cur.h += h + gapY;
-    }
-    const canvases = strips.map(s => {
-      const cv = document.createElement('canvas'); cv.width = stripW; cv.height = s.h;
-      const cx = cv.getContext('2d'); const out = cx.createImageData(stripW, s.h), o = out.data; o.fill(255);
-      for (const { c, y: ty } of s.items) for (let y = c.ay0; y <= c.ay1; y++) { const go = (y / G | 0) * gw;
-        for (let x = c.ax0; x <= c.ax1; x++) { const l = label[go + (x / G | 0)];
-          if (l !== c.id && l !== -1) continue;        // 기울어진 표에서 이웃 칸 글자가 끼어들지 않게 함
-          const v = d[(y * W + x) * 4], i = ((ty + y - c.ay0) * stripW + pad + x - c.ax0) * 4; o[i] = o[i + 1] = o[i + 2] = v; } }
-      cx.putImageData(out, 0, 0); return cv;
-    });
-    // 칸 밖(제목·본문·쪽 번호)
-    let restInk = 0; const rest = document.createElement('canvas'); rest.width = W; rest.height = H;
-    const rx = rest.getContext('2d'); const ro = rx.createImageData(W, H), r = ro.data;
-    for (let y = 0; y < H; y++) { const go = (y / G | 0) * gw;
-      for (let x = 0; x < W; x++) { const p = y * W + x, i = p * 4, l = label[go + (x / G | 0)];
-        const inCell = l > 0 && isCell[l]; const v = inCell ? 255 : d[i];
-        r[i] = r[i + 1] = r[i + 2] = v; r[i + 3] = 255; if (!inCell && bin[p]) restInk++; } }
-    rx.putImageData(ro, 0, 0);
-    return { strips: canvases, rest, restInk };
-  }
-
   async function setPsm(w, v) { if (w.__psm !== v) { await w.setParameters({ tessedit_pageseg_mode: v }); w.__psm = v; } }
   // 표가 있는 쪽: 칸 밖은 일반 방식으로, 칸 안은 칸 단위로 읽음. 잘 안 읽히면 null (일반 방식으로 되돌아감)
-  async function ocrTable(w, seg, psm) {
-    const t = tableImages(seg); const parts = []; let conf = 0, n = 0;
-    if (t.restInk > 80 * seg.sc * seg.sc) { await setPsm(w, psm); parts.push((await recog(w, t.rest, 0)).text); }
+  async function ocrTable(w, t, psm) {
+    const parts = [], lines = []; let conf = 0, n = 0;
+    if (t.restInk > 80 * t.sc * t.sc) { await setPsm(w, psm); const r = await recog(w, t.rest, 0); parts.push(r.text); lines.push(...(r.lines || [])); }
     await setPsm(w, CFG.psmc);
     let ratio = 0;
-    for (const s of t.strips) { const r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; s.width = s.height = 0; }
-    t.rest.width = t.rest.height = 0;
+    for (let si = 0; si < t.strips.length; si++) {
+      const s = t.strips[si], r = await recog(w, s, 0); parts.push(r.text); conf += r.conf; ratio += r.ratio; n++; free(s);
+      for (const L of r.lines || []) {      // 칸 그림 위치 → 쪽 위치
+        const cy = (L.y0 + L.y1) / 2, pl = (t.places[si] || []).find(p => cy >= p.ty && cy < p.ty + p.h + 1);
+        if (pl) lines.push({ t: L.t, x0: L.x0 + pl.dx, x1: L.x1 + pl.dx, y0: L.y0 - pl.ty + pl.dy, y1: L.y1 - pl.ty + pl.dy });
+      }
+    }
+    free(t.rest);
     if (!n || conf / n < 45 || ratio / n < 0.35) return null;
-    return { text: parts.join('\n'), deg: 0, table: true, conf: conf / n };
+    return { text: parts.join('\n'), deg: 0, table: true, conf: conf / n, lines };
   }
-  // 한 쪽을 그려서 읽음
+  // 한 쪽을 그려서 읽음. 그린 뒤 전처리·표 찾기는 준비 작업자가 하고(있으면) 화면 쪽은 그리기만 함
   async function ocrPage(w, page, dpi, psm, knownDeg) {
+    if (PREP.on) try { return await ocrPageWith(true, w, page, dpi, psm, knownDeg); } catch (e) { prepFail(e); }
+    return ocrPageWith(false, w, page, dpi, psm, knownDeg);
+  }
+  async function ocrPageWith(remote, w, page, dpi, psm, knownDeg) {
+    const P0 = performance.now();
     const canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
-    if (CFG.prep) enhance(canvas);
-    let res = null;
-    const seg = CFG.table ? segment(canvas, dpi) : null;
-    if (seg && seg.cells.length && !knownDeg) res = await ocrTable(w, seg, psm);
-    if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, canvas, knownDeg); res.canvas = canvas; }
-    else canvas.width = canvas.height = 0;
+    const P1 = performance.now();
+    let pr;     // { img: 정리한 쪽 그림, table: { rest, strips, restInk, sc } | null }
+    if (remote) pr = await PREP.call('p1', canvas, { dpi, prep: CFG.prep, table: CFG.table, useTable: !knownDeg });
+    else {
+      if (CFG.prep) enhance(canvas);
+      const seg = CFG.table ? segment(canvas, dpi) : null;
+      pr = { img: canvas, table: seg && seg.cells.length && !knownDeg ? Object.assign(tableImages(seg), { sc: seg.sc }) : null };
+    }
+    if (Q.get('debug')) console.log(`1차 render ${(P1 - P0) | 0}ms 전처리·표 찾기${remote ? '(작업자)' : ''} ${(performance.now() - P1) | 0}ms`);
+    const W1 = pr.img.width, H1 = pr.img.height;
+    let res = pr.table ? await ocrTable(w, pr.table, psm) : null;
+    if (!res) { await setPsm(w, psm); res = await ocrCanvas(w, pr.img, knownDeg); res.canvas = pr.img; }
+    else free(pr.img);
+    res.W = W1; res.H = H1;
     return res;
   }
 
+  // ---------- 준비 작업자: 그린 쪽의 전처리·표/글줄 찾기·글줄 자르기를 화면 쪽 대신 함 ----------
+  // 코어가 많은 컴퓨터에서 화면 쪽(메인 스레드)이 막혀 작업자들이 기다리는 것을 막음
+  const PREP = { on: CFG.prepw && typeof OffscreenCanvas !== 'undefined' && !Q.get('dumpg') && !Q.get('crops'), ws: [], seq: 0, src: null };
+  function prepFail(e) { console.warn('준비 작업자를 쓸 수 없어 화면 쪽에서 처리:', e); PREP.on = false; PREP.ws.forEach(x => x.w.terminate()); PREP.ws = []; }
+  PREP.get = async () => {    // 할 일이 가장 적은 작업자 (처음 부를 때 만듦)
+    if (!PREP.ws.length) {
+      if (!PREP.src) PREP.src = new TextDecoder().decode(await asset('a-prepworker', true));
+      if (PREP.ws.length) return PREP.ws.reduce((a, b) => b.load < a.load ? b : a);
+      const url = URL.createObjectURL(new Blob(['const makeImgProc = ' + makeImgProc.toString() + ';\n', PREP.src], { type: 'text/javascript' }));
+      for (let i = 0; i < Math.max(1, Math.round(CFG.workers / 6)); i++) {
+        const w = new Worker(url), x = { w, load: 0, pend: new Map() };
+        w.onmessage = e => { const p = x.pend.get(e.data.id); if (!p) return; x.pend.delete(e.data.id); x.load--; e.data.error ? p.no(new Error(e.data.error)) : p.ok(e.data); };
+        w.onerror = e => { for (const p of x.pend.values()) p.no(new Error(e.message || '준비 작업자 오류')); x.pend.clear(); };
+        w.postMessage({ type: 'init', cfg: CFG });
+        PREP.ws.push(x);
+      }
+    }
+    return PREP.ws.reduce((a, b) => b.load < a.load ? b : a);
+  };
+  PREP.send = (x, m, tr) => new Promise((ok, no) => { m.id = ++PREP.seq; x.load++; x.pend.set(m.id, { ok, no }); x.w.postMessage(m, tr || []); });
+  // 그린 캔버스의 픽셀을 작업자로 넘기고(캔버스는 비움) 결과를 받음
+  PREP.call = async (type, canvas, extra) => {
+    const x = await PREP.get();
+    const W = canvas.width, H = canvas.height, buf = canvas.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, W, H).data.buffer;
+    canvas.width = canvas.height = 0;
+    const r = await PREP.send(x, Object.assign({ type, W, H, buf }, extra), [buf]);
+    r.x = x; return r;
+  };
+
   // ---------- 신경망 인식 (PP-OCRv5 한국어) ----------
+  // 메인 스레드가 바빴던 시간(50ms 넘게 막힌 일의 합). 코어가 많은 컴퓨터에서 병목인지 보려고 잼
+  let mainBusy = 0;
+  try { new PerformanceObserver(l => { for (const e of l.getEntries()) mainBusy += e.duration; }).observe({ type: 'longtask', buffered: false }); } catch (e) {}
   const NN = { ok: !!$('a-ort') && CFG.engine !== 'tess', pool: [], res: null };
-  function nnWorker() {
-    return (async () => {
-      if (!NN.res) NN.res = (async () => ({
+  const GPU = { state: CFG.gpu === '0' ? 'off' : 'idle', why: CFG.gpu === '0' ? '주소에 ?gpu=0 을 붙여 꺼 둠' : '', w: null, p: null, name: '', speed: 0 };
+  const gpuEl = document.createElement('div'); gpuEl.id = 'gpuNote';
+  gpuEl.style.cssText = 'font-size:.85rem;color:var(--muted);margin-top:4px';
+  statusEl.insertAdjacentElement('afterend', gpuEl);
+  const nnRes = () => NN.res || (NN.res = (async () => { const T = performance.now(); const R = {
         url: URL.createObjectURL(new Blob([await asset('a-ort', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
-        wasm: await asset('a-ortwasm', true), model: await asset('a-recmodel', true),
+        mjs: new TextDecoder().decode(await asset('a-ortmjs', true)),
+        wasm: await asset('a-ortwasm', true), model: await asset('a-recmodel', true), weights: await asset('a-recw', true),
         dict: new TextDecoder().decode(await asset('a-recdict', true))
-      }))();
-      const R = await NN.res;
-      const w = new Worker(R.url); let seq = 0; const pend = new Map();
+      }; if (Q.get('debug')) console.log('NN 자원 ' + ((performance.now() - T) | 0) + 'ms'); return R; })());
+  // ep: 'wasm'(CPU) | 'webgpu'(그래픽카드)
+  function nnWorker(ep = 'wasm') {
+    return (async () => {
+      const R = await nnRes(), gpu = ep === 'webgpu';
+      if (gpu) {        // 그래픽카드가 보일 때만 그래픽카드용 엔진을 풀어 씀
+        const a = navigator.gpu && await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }).catch(() => null);
+        const ai = (a && a.info) || {};
+        // 인텔 내장 그래픽은 CPU와 전력·메모리를 나눠 써서 분석 중엔 오히려 느려짐(사용자 컴퓨터에서 확인). 인텔 독립형(Arc, …hpg)은 사용
+        if (a && CFG.gpu === 'auto' && /intel/i.test(ai.vendor || '') && !/hpg/i.test(ai.architecture || ''))
+          throw new Error(`내장 그래픽(${ai.architecture || 'intel'})은 CPU와 전력을 나눠 써서 오히려 느려짐 — 켜려면 주소 끝에 ?gpu=1`);
+        if (!a) throw new Error(navigator.gpu ? '브라우저가 그래픽카드를 내주지 않음 — 주소창에 chrome://gpu (엣지는 edge://gpu) 를 열어 WebGPU 항목 확인' : '이 브라우저는 WebGPU를 지원하지 않음');
+        if (!NN.gres) NN.gres = (async () => ({
+          url: URL.createObjectURL(new Blob([await asset('a-ortgpu', true), '\n;', await asset('a-recworker', true)], { type: 'text/javascript' })),
+          mjs: new TextDecoder().decode(await asset('a-ortgpumjs', true)), wasm: await asset('a-ortgpuwasm', true), model: await asset('a-recgpu', true) }))();
+      }
+      const G = gpu ? await NN.gres : R, model = G.model;
+      const w = new Worker(G.url); let seq = 0; const pend = new Map();
       w.onmessage = e => { const p = pend.get(e.data.id); if (!p) return; pend.delete(e.data.id); e.data.type === 'error' ? p.no(new Error(e.data.message)) : p.ok(e.data); };
       w.onerror = e => { for (const p of pend.values()) p.no(new Error(e.message || '인식 작업자 오류')); pend.clear(); };
       const call = (m, tr) => new Promise((ok, no) => { m.id = ++seq; pend.set(m.id, { ok, no }); w.postMessage(m, tr || []); });
-      await call({ type: 'init', wasm: R.wasm, model: R.model, dict: R.dict });
-      return { rec: lines => call({ type: 'rec', lines }, lines.map(l => l.data.buffer)), terminate: () => w.terminate() };
+      const Ti = performance.now();
+      let ready;
+      try { ready = await call({ type: 'init', ep, force: CFG.gpu === 'force', mjs: G.mjs, wasm: G.wasm, model, weights: R.weights, dict: R.dict }); }
+      catch (e) { w.terminate(); throw e; }
+      if (Q.get('debug')) console.log(ep + ' init ' + ((performance.now() - Ti) | 0) + 'ms' + (gpu ? `, 글줄 너비 1픽셀당 ${ready.msPerCol.toFixed(4)}ms` : ''));
+      // 그래픽카드 작업자는 실패하면 같은 글줄을 CPU가 다시 읽어야 하므로 자료를 넘기지 않고 복사해서 보냄
+      return { gpu, msPerCol: ready.msPerCol, name: ready.gpuName || '', rec: lines => call({ type: 'rec', lines }, gpu ? [] : lines.map(l => l.data.buffer)), terminate: () => w.terminate() };
     })();
   }
 
-  // 글줄 찾기: 글자를 가로로 번지게 해서 이어진 덩어리를 한 줄로 봄 (표 선은 넘지 않음). 줄마다 기울기도 구함
-  function textLines(seg) {
-    const { bin, line, W, H, hchar, label, isCell, G, gw } = seg;
-    const hw = W >> 1, hh = H >> 1, n2 = hw * hh;
-    const sm = new Uint8Array(n2), bar = new Uint8Array(n2);
-    for (let y = 0; y < hh; y++) { const o = y * hw, p0 = 2 * y * W;
-      for (let x = 0; x < hw; x++) { const p = p0 + 2 * x;
-        if (bin[p] | bin[p + 1] | bin[p + W] | bin[p + W + 1]) sm[o + x] = 1;
-        if (line[p] | line[p + 1] | line[p + W] | line[p + W + 1]) bar[o + x] = 1; } }
-    const gapMax = Math.max(3, Math.round(hchar * CFG.gap / 2));
-    for (let y = 0; y < hh; y++) { const o = y * hw; let last = -1;
-      for (let x = 0; x < hw; x++) {
-        if (bar[o + x]) { last = -1; continue; }
-        if (sm[o + x] === 1) { if (last >= 0 && x - last > 1 && x - last - 1 <= gapMax) for (let k = last + 1; k < x; k++) sm[o + k] = 2; last = x; }
-      } }
-    // 덩어리 표시 + 통계
-    const lab = new Int32Array(n2), stack = new Int32Array(n2), comps = [null];
-    for (let p0 = 0; p0 < n2; p0++) {
-      if (!sm[p0] || lab[p0]) continue;
-      const id = comps.length; let sp = 0, n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0, x0 = hw, x1 = 0, y0 = hh, y1 = 0;
-      stack[sp++] = p0; lab[p0] = id;
-      while (sp) {
-        const p = stack[--sp], x = p % hw, y = (p - x) / hw;
-        n++; sx += x; sy += y; sxx += x * x; sxy += x * y;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= hh) continue;
-          for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= hw) continue;
-            const q = yy * hw + xx; if (sm[q] && !lab[q]) { lab[q] = id; stack[sp++] = q; } } }
+  // 신경망 작업자 묶음: 한 쪽의 글줄을 몇 줄씩 나눠 쉬는 작업자가 바로 가져가 읽음 → 마지막 쪽도 모든 코어가 함께 읽음
+  // 그래픽카드 작업자가 있으면 여러 묶음을 한 번에 가져감. 실패하거나 CPU보다 느리면 빼고 CPU로 계속
+  function nnPool(live) {
+    const idle = [], q = [], all = []; let size = 0, closed = false, failed = null;
+    const st = { cpuMs: 0, cpuN: 0, cpuCols: 0, gpuMs: 0, gpuN: 0, gpuCols: 0, gpuRuns: 0, gpuWhy: '' };
+    // CPU 작업자 하나의 글줄 너비 1픽셀당 시간 (아직 잰 것이 없으면 4코어 시험 컴퓨터에서 잰 값)
+    const cpuPerCol = () => st.cpuCols >= 4000 ? st.cpuMs / st.cpuCols : 0.26;
+    const retire = (w, why) => { const i = all.indexOf(w); if (i >= 0) all.splice(i, 1); size--; w.terminate(); st.gpuWhy = why; console.warn('그래픽카드 판독 중단:', why);
+      if (w === GPU.w) { GPU.w = null; GPU.state = 'off'; GPU.why = why; gpuShow(); } };
+    const pump = () => {
+      while (idle.length && q.length) {
+        const w = idle.pop(), jobs = [q.shift()];
+        if (!live()) { jobs[0].no(new Error('중지됨')); idle.push(w); continue; }
+        if (w.gpu) { let n = jobs[0].lines.length; while (q.length && n + q[0].lines.length <= CFG.gpuBatch) { n += q[0].lines.length; jobs.push(q.shift()); } }
+        const lines = jobs.flatMap(j => j.lines), t0 = performance.now(), cols = lines.reduce((a, l) => a + l.w, 0);
+        w.rec(lines).then(r => {
+          const ms = performance.now() - t0;
+          if (w.gpu) { st.gpuMs += ms; st.gpuN += lines.length; st.gpuCols += cols; st.gpuRuns++; } else { st.cpuMs += ms; st.cpuN += lines.length; st.cpuCols += cols; }
+          let k = 0; for (const j of jobs) { const n = j.lines.length; j.ok({ texts: r.texts.slice(k, k + n), confs: r.confs.slice(k, k + n) }); k += n; }
+          if (closed) return;
+          // 그래픽카드가 CPU 작업자 하나보다 느리면 빼냄 (처음 몇 번은 모양별 준비 시간이 섞여 있어 기다림)
+          if (w.gpu && CFG.gpu !== 'force' && st.gpuRuns >= 4 && st.gpuMs / st.gpuCols > cpuPerCol()) return retire(w, 'CPU보다 느림');
+          idle.push(w); pump();
+        }, e => {
+          if (w.gpu) { q.unshift(...jobs); if (!closed) { retire(w, String(e && e.message || e)); pump(); } return; }
+          jobs.forEach(j => j.no(e)); if (!closed) { idle.push(w); pump(); }
+        });
       }
-      let b = 0; const wd = x1 - x0 + 1, ht = y1 - y0 + 1, den = n * sxx - sx * sx;
-      if (wd > 4 * ht && wd > 30 && den > 0) b = Math.max(-0.08, Math.min(0.08, (n * sxy - sx * sy) / den));
-      comps.push({ id, n, x0, x1, y0, y1, b, r0: 1e9, r1: -1e9 });
-    }
-    for (let p = 0; p < n2; p++) { const id = lab[p]; if (!id) continue; const c = comps[id], x = p % hw, r = (p - x) / hw - c.b * x; if (r < c.r0) c.r0 = r; if (r > c.r1) c.r1 = r; }
-    const minT = hchar * 0.45 / 2, minL = hchar * 0.6 / 2;
-    let cand = comps.filter(c => c && c.r1 - c.r0 + 1 >= minT && c.x1 - c.x0 + 1 >= minL);
-    if (!cand.length) return [];
-    const ts = cand.filter(c => c.x1 - c.x0 > 3 * (c.r1 - c.r0)).map(c => c.r1 - c.r0 + 1).sort((a, b) => a - b);
-    const medT = ts.length ? ts[ts.length >> 1] : hchar / 2;
-    // 위아래 줄이 붙어 버린 덩어리는 가로 농도 골짜기에서 나눔
-    const tall = new Map();
-    for (const c of cand) if (c.r1 - c.r0 + 1 > medT * 1.75) tall.set(c.id, new Int32Array(Math.ceil(c.r1 - c.r0 + 2)));
-    if (tall.size) for (let p = 0; p < n2; p++) { const h = tall.get(lab[p]); if (!h || sm[p] !== 1) continue; const c = comps[lab[p]], x = p % hw; h[Math.round((p - x) / hw - c.b * x - c.r0)]++; }
-    const out = [];
-    for (const c of cand) {
-      const h = tall.get(c.id); let parts = [[c.r0, c.r1]];
-      if (h) {
-        let mx = 0; for (const v of h) if (v > mx) mx = v;
-        const cuts = []; let i = 0;
-        while (i < h.length) { if (h[i] <= mx * 0.1) { let j = i; while (j < h.length && h[j] <= mx * 0.1) j++; if (i > 0 && j < h.length) cuts.push((i + j - 1) / 2); i = j; } else i++; }
-        if (cuts.length) { parts = []; let a = 0; for (const k of cuts.concat([h.length - 1])) { if (k - a + 1 >= minT) parts.push([c.r0 + a, c.r0 + k]); a = k + 1; } }
-      }
-      for (const [r0, r1] of parts) {
-        const x0 = c.x0 * 2, x1 = c.x1 * 2 + 1, t = (r1 - r0 + 1) * 2, cx = (x0 + x1) / 2, cy = r0 * 2 + c.b * cx + t / 2;
-        const lb = label[Math.min(seg.gh - 1, Math.max(0, cy / G | 0)) * gw + Math.min(gw - 1, cx / G | 0)];
-        out.push({ x0, x1, b: c.b, rTop: r0 * 2, t, cx, cy, cell: lb > 0 && isCell && isCell[lb] ? lb : 0 });
-      }
-    }
-    return out;
+    };
+    return {
+      st,
+      get size() { return size; },
+      add(wp, optional) {
+        size++;
+        wp.then(w => { if (closed) { if (!w.keep) w.terminate(); return; } all.push(w); idle.push(w); pump(); },
+          e => { size--; if (optional) { st.gpuWhy = String(e && e.message || e); if (Q.get('debug')) console.log('그래픽카드 사용 안 함:', st.gpuWhy); }
+            else if (!size && !all.length) { failed = e; q.splice(0).forEach(j => j.no(e)); } });   // 그래픽카드 실패는 CPU 작업자에 영향 없음
+      },
+      async rec(lines) {
+        if (failed) throw failed;
+        const parts = [];
+        for (let i = 0; i < lines.length; i += CFG.chunk) parts.push(lines.slice(i, i + CFG.chunk));
+        const rs = await Promise.all(parts.map(l => new Promise((ok, no) => { q.push({ lines: l, ok, no }); pump(); })));
+        return { texts: rs.flatMap(r => r.texts), confs: rs.flatMap(r => r.confs) };
+      },
+      close() { closed = true; q.splice(0).forEach(j => j.no(new Error('중지됨'))); all.forEach(w => { if (!w.keep) w.terminate(); }); }   // 그래픽카드 작업자는 다음 파일에도 씀
+    };
   }
 
-  // 읽는 순서: 표 칸이나 문단 단위로 묶고, 묶음 안에서는 위→아래, 왼→오른쪽
-  function orderLines(lines, seg) {
-    const par = lines.map((_, i) => i), find = i => { while (par[i] !== i) i = par[i] = par[par[i]]; return i; };
-    const cellRoot = new Map();
-    const idx = lines.map((_, i) => i).sort((a, b) => lines[a].cy - lines[b].cy);
-    for (let ii = 0; ii < idx.length; ii++) { const i = idx[ii], A = lines[i];
-      if (A.cell) { if (cellRoot.has(A.cell)) par[find(i)] = find(cellRoot.get(A.cell)); else cellRoot.set(A.cell, i); continue; }
-      for (let jj = ii + 1; jj < idx.length; jj++) { const j = idx[jj], B = lines[j];
-        const dy = B.cy - A.cy; if (dy > (A.t + B.t) * 1.5) break;
-        if (B.cell) continue;
-        const ov = Math.min(A.x1, B.x1) - Math.max(A.x0, B.x0);
-        if (ov >= 0.4 * Math.min(A.x1 - A.x0, B.x1 - B.x0) || (dy < Math.min(A.t, B.t) * 0.5 && -ov < 3 * Math.max(A.t, B.t))) par[find(j)] = find(i);
-      } }
-    const groups = new Map();
-    lines.forEach((l, i) => { const r = find(i); let g = groups.get(r); if (!g) groups.set(r, g = { lines: [], x0: 1e9, y0: 1e9 }); g.lines.push(l); g.x0 = Math.min(g.x0, l.x0); g.y0 = Math.min(g.y0, l.cy - l.t / 2); });
-    const gs = [...groups.values()], tol = 28 * seg.sc;
-    gs.sort((a, b) => a.y0 - b.y0);
-    const ordered = []; let row = [], top = -1e9;
-    const flush = () => { row.sort((a, b) => a.x0 - b.x0); ordered.push(...row); row = []; };
-    for (const g of gs) { if (g.y0 - top > tol) { flush(); top = g.y0; } row.push(g); }
-    flush();
-    for (const g of ordered) g.lines.sort((a, b) => Math.abs(a.cy - b.cy) < Math.min(a.t, b.t) * 0.5 ? a.x0 - b.x0 : a.cy - b.cy);
-    return ordered;
-  }
-
-  // 한 줄을 기울기에 맞춰 펴서 높이 48 픽셀 입력으로 만듦
-  const lineCv = document.createElement('canvas'); lineCv.width = 2400; lineCv.height = 48;
-  const lineCx = lineCv.getContext('2d', { willReadFrequently: true });
-  function lineTensor(src, ln, flip) {
-    const th = Math.atan(ln.b), cos = Math.cos(th), sin = Math.sin(th);
-    const pad = Math.round(ln.t * CFG.pad) + 2, hgt = ln.t + 2 * pad, len = (ln.x1 - ln.x0 + 1) / cos + 2 * pad;
-    const s = 48 / hgt, wout = Math.max(16, Math.min(2400, Math.round(len * s * CFG.squeeze))), sx = wout / len;
-    const ox = ln.x0, oy = ln.rTop + ln.b * ln.x0;
-    const a = sx * cos, c = sx * sin, b = -s * sin, d = s * cos;
-    lineCx.setTransform(1, 0, 0, 1, 0, 0); lineCx.fillStyle = '#fff'; lineCx.fillRect(0, 0, wout, 48);
-    lineCx.imageSmoothingEnabled = true; lineCx.imageSmoothingQuality = 'high';
-    lineCx.save(); lineCx.beginPath(); lineCx.rect(0, 0, wout, 48); lineCx.clip();
-    lineCx.setTransform(a, b, c, d, pad * sx - (a * ox + c * oy), pad * s - (b * ox + d * oy));
-    const m = pad + 6, bx = Math.max(0, Math.floor(ln.x0 - m)), bw = Math.min(src.width, Math.ceil(ln.x1 + m)) - bx;
-    const yA = oy - m - Math.abs(ln.b) * (ln.x1 - ln.x0), by = Math.max(0, Math.floor(yA)), bh = Math.min(src.height, Math.ceil(oy + ln.t + m + Math.abs(ln.b) * (ln.x1 - ln.x0))) - by;
-    if (bw > 0 && bh > 0) lineCx.drawImage(src, bx, by, bw, bh, bx, by, bw, bh);
-    lineCx.restore();
-    const px = lineCx.getImageData(0, 0, wout, 48).data, n = wout * 48, data = new Float32Array(3 * n);
-    let g = new Uint8Array(n); for (let i = 0; i < n; i++) g[i] = px[i * 4];
-    for (let k = 0; k < CFG.thin; k++) {       // 굵게 뭉친 획을 조금 가늘게 (밝은 쪽으로 최대값 필터)
-      const o = new Uint8Array(n);
-      for (let y = 0; y < 48; y++) for (let x = 0; x < wout; x++) { const i = y * wout + x; let v = g[i];
-        if (x > 0 && g[i - 1] > v) v = g[i - 1]; if (x < wout - 1 && g[i + 1] > v) v = g[i + 1];
-        if (y > 0 && g[i - wout] > v) v = g[i - wout]; if (y < 47 && g[i + wout] > v) v = g[i + wout]; o[i] = v; }
-      g = o; }
-    for (let i = 0; i < n; i++) { const v = g[flip ? n - 1 - i : i] / 127.5 - 1; data[i] = data[n + i] = data[2 * n + i] = v; }
-    if (Q.get('crops') && (window.__crops = window.__crops || []).length < +Q.get('crops')) { const c = document.createElement('canvas'); c.width = wout; c.height = 48; c.getContext('2d').drawImage(lineCv, 0, 0); window.__crops.push(c.toDataURL()); }
-    return { w: wout, data };
-  }
-
-  // 그림 한 장을 읽음. sample 을 주면 긴 줄 몇 개만 읽어 방향 판별용 신뢰도만 구함
-  async function nnRead(nw, canvas, dpi, sample, flip) {
+  // 쪽 하나(돌린 상태 그대로)를 읽음. sample 을 주면 긴 줄 몇 개만 읽어 방향 판별용 신뢰도만 구함
+  async function nnRead(nw, h, sample) {
     const T0 = performance.now();
-    const seg = segment(canvas, dpi); if (!seg) return null;
+    const pr = await h.read(sample); if (!pr) return null;
     const T1 = performance.now();
-    const lines = textLines(seg); if (!lines.length) return null;
-    const T2 = performance.now();
     if (sample) {
-      const pick = lines.slice().sort((a, b) => (b.x1 - b.x0) - (a.x1 - a.x0)).slice(0, sample);
-      const up = await nw.rec(pick.map(l => lineTensor(canvas, l, false))), dn = await nw.rec(pick.map(l => lineTensor(canvas, l, true)));
+      const up = await nw.rec(pr.up), dn = await nw.rec(pr.dn);
       const avg = r => r.confs.reduce((s, v, i) => s + v * r.texts[i].length, 0) / Math.max(1, r.texts.reduce((s, t) => s + t.length, 0));
       return { up: avg(up), down: avg(dn) };
     }
-    const groups = orderLines(lines, seg), flat = [];
-    for (const g of groups) for (const l of g.lines) flat.push(l);
-    const tens = flat.map(l => lineTensor(canvas, l, false)); const T3 = performance.now();
-    const r = await nw.rec(tens);
-    if (Q.get('debug')) console.log(`segment ${(T1 - T0) | 0}ms, textLines ${(T2 - T1) | 0}ms, order+crops ${(T3 - T2) | 0}ms, rec ${(performance.now() - T3) | 0}ms, 줄 ${flat.length}`);
+    const r = await nw.rec(pr.tensors);
+    if (Q.get('debug')) console.log(`글줄 찾기·자르기 ${(T1 - T0) | 0}ms, rec ${(performance.now() - T1) | 0}ms, 줄 ${r.texts.length}`);
     let k = 0, cs = 0, cn = 0, text = ''; const boxes = [];
-    for (const g of groups) { let first = true;
-      for (let i = 0; i < g.lines.length; i++, k++) { const t = r.texts[k], cf = r.confs[k], l = g.lines[i];
+    for (const g of pr.groups) { let first = true;
+      for (let i = 0; i < g.length; i++, k++) { const t = r.texts[k], cf = r.confs[k], l = g[i];
         if (Q.get('crops')) (window.__recs = window.__recs || []).push(cf.toFixed(2) + ' ' + t);
         if (!t || cf < 0.3) continue;        // 잡티를 글자로 읽은 것은 버림
         if (text) text += first ? '\n\n' : '\n';
@@ -522,31 +381,55 @@
         const yA = l.rTop + l.b * l.x0, yB = l.rTop + l.b * l.x1;
         boxes.push([text.length, text.length + t.length, l.x0, Math.min(yA, yB), l.x1, Math.max(yA, yB) + l.t]);
         text += t; cs += cf * t.length; cn += t.length; } }
-    return { text, boxes, W: canvas.width, H: canvas.height, conf: cn ? cs / cn : 0, chars: cn, table: seg.cells.length > 0 };
+    return { text, boxes, W: pr.W, H: pr.H, conf: cn ? cs / cn : 0, chars: cn, table: pr.table };
+  }
+  // 쪽 그림 다루개: 돌리기·글줄 읽기를 화면 쪽에서 하거나, 준비 작업자에게 맡김(그 쪽 그림은 작업자가 갖고 있음)
+  async function pageHandle(canvas, dpi, remote) {
+    if (remote) {
+      const pid = ++PREP.seq, r = await PREP.call('open2', canvas, { pid, dpi, prep: CFG.prep }), x = r.x;
+      return { vertical: r.vertical, W0: r.W0, H0: r.H0, turn: deg => PREP.send(x, { type: 'turn', pid, deg }),
+        read: sample => PREP.send(x, { type: 'read', pid, sample }).then(m => m.res), close: () => PREP.send(x, { type: 'close', pid }).catch(() => {}) };
+    }
+    if (CFG.prep) enhance(canvas);
+    let c = canvas;
+    return { vertical: linesAreVertical(c), W0: c.width, H0: c.height,
+      turn: async deg => { const n = rotated(c, deg); c.width = c.height = 0; c = n; },
+      read: async sample => IP.readLines(c, dpi, sample), close: () => { c.width = c.height = 0; } };
   }
 
   // 한 쪽을 신경망으로 읽음. 누웠거나 뒤집힌 쪽은 돌려서 읽음. 실패하면 null
-  async function nnPage(nw, page, dpi, knownDeg) {
-    const P0 = performance.now();
-    let canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
-    if (CFG.prep) enhance(canvas);
-    const P1 = performance.now(); let flipCheck = false;
-    const W0 = canvas.width, H0 = canvas.height; let rot = 0;
-    const turn = deg => { const c = rotated(canvas, deg); canvas.width = canvas.height = 0; canvas = c; rot = (rot + deg) % 360; };
-    let res;
-    if (linesAreVertical(canvas)) {
-      turn(90);
-      const sm = await nnRead(nw, canvas, dpi, 12);
-      if (sm && sm.down > sm.up) turn(180);
-      res = await nnRead(nw, canvas, dpi);
-    } else {
-      res = await nnRead(nw, canvas, dpi);
-      if (res && res.conf < 0.8 && res.chars >= 8) { flipCheck = true;       // 신뢰도가 낮으면 위아래가 뒤집혔는지 확인
-        const sm = await nnRead(nw, canvas, dpi, 12);
-        if (sm && sm.down > sm.up + 0.08) { turn(180); res = await nnRead(nw, canvas, dpi) || res; }
-      }
+  async function nnPage(nw, page, dpi) {
+    if (PREP.on) {
+      let prepErr = null;
+      try { return await nnPageWith(true, nw, page, dpi, e => { prepErr = e; }); }
+      catch (e) { if (!prepErr) throw e; prepFail(prepErr); }     // 준비 작업자 문제일 때만 화면 쪽에서 다시
     }
-    canvas.width = canvas.height = 0;
+    return nnPageWith(false, nw, page, dpi);
+  }
+  async function nnPageWith(remote, nw, page, dpi, onPrepErr) {
+    const P0 = performance.now();
+    const canvas = await renderToCanvas(page, dpi / 72, CFG.maxPx);
+    const guard = p => remote ? p.catch(e => { onPrepErr(e); throw e; }) : p;
+    const h = await guard(pageHandle(canvas, dpi, remote));
+    const P1 = performance.now(); let flipCheck = false;
+    const W0 = h.W0, H0 = h.H0; let rot = 0;
+    const turn = async deg => { await guard(h.turn(deg)); rot = (rot + deg) % 360; };
+    const hr = { read: sample => guard(h.read(sample)) };
+    let res;
+    try {
+      if (h.vertical) {
+        await turn(90);
+        const sm = await nnRead(nw, hr, 12);
+        if (sm && sm.down > sm.up) await turn(180);
+        res = await nnRead(nw, hr);
+      } else {
+        res = await nnRead(nw, hr);
+        if (res && res.conf < 0.8 && res.chars >= 8) { flipCheck = true;       // 신뢰도가 낮으면 위아래가 뒤집혔는지 확인
+          const sm = await nnRead(nw, hr, 12);
+          if (sm && sm.down > sm.up + 0.08) { await turn(180); res = await nnRead(nw, hr) || res; }
+        }
+      }
+    } finally { h.close(); }
     if (res && res.boxes) {
       const back = (x, y) => { const Wr = res.W, Hr = res.H;      // 돌린 그림의 점 → 원래 쪽의 점
         return rot === 90 ? [y, Wr - x] : rot === 180 ? [Wr - x, Hr - y] : rot === 270 ? [Hr - y, x] : [x, y]; };
@@ -555,7 +438,7 @@
         return [s, e, +(Math.min(a[0], b[0]) / W0).toFixed(4), +(Math.min(a[1], b[1]) / H0).toFixed(4), +(Math.max(a[0], b[0]) / W0).toFixed(4), +(Math.max(a[1], b[1]) / H0).toFixed(4), rot];
       });
     }
-    if (Q.get('debug')) console.log(`nnPage render+enhance ${(P1 - P0) | 0}ms, 나머지 ${(performance.now() - P1) | 0}ms, 뒤집힘 확인 ${flipCheck}, conf ${res && res.conf.toFixed(2)}`);
+    if (Q.get('debug')) console.log(`nnPage 그리기${remote ? '·넘기기' : '·전처리'} ${(P1 - P0) | 0}ms, 나머지 ${(performance.now() - P1) | 0}ms, 뒤집힘 확인 ${flipCheck}, conf ${res && res.conf.toFixed(2)}`);
     return res && res.chars ? res : null;
   }
 
@@ -587,6 +470,10 @@
       await new Promise(ok => { tx.oncomplete = ok; tx.onerror = ok; });
     } catch (e) { console.warn('결과 저장 실패', e); }
   }
+  async function cacheAll() {
+    try { const db = await idb(); return await new Promise(ok => { const r = db.transaction('docs').objectStore('docs').getAll(); r.onsuccess = () => ok(r.result || []); r.onerror = () => ok([]); }); }
+    catch (e) { return []; }
+  }
   async function cacheClear() {
     try { const db = await idb(); const tx = db.transaction('docs', 'readwrite'); tx.objectStore('docs').clear(); await new Promise(ok => { tx.oncomplete = ok; tx.onerror = ok; }); } catch (e) {}
   }
@@ -594,40 +481,65 @@
   // ---------- 분석 ----------
   const fmtLeft = sec => sec < 60 ? `약 ${Math.max(5, Math.round(sec / 5) * 5)}초 남음` : `약 ${Math.round(sec / 60)}분 남음`;
   async function analyze(file) {
-    const my = ++runId;
+    const my = ++runId; if (NN.cancel) NN.cancel();
     curFile = file; pages = []; total = 0; pdf = null; running = true;
-    $('dropTitle').textContent = file.name;
-    $('dropSub').textContent = '다른 파일을 분석하려면 다시 누르거나 끌어다 놓으세요';
+    curDoc = docs.find(d => d.file === file);
+    if (!curDoc) { curDoc = { file, name: file.name }; docs.push(curDoc); }
+    Object.assign(curDoc, { pages, total: 0, pdf: null, state: 'run', note: '', p2: '' });
+    const me = curDoc; renderDocs();
     bar.classList.remove('hidden'); bar.value = 0; $('stop').classList.remove('hidden');
     setStatus('PDF를 여는 중…'); search();
     try {
       const data = await file.arrayBuffer();
       const optsKey = ($('force').checked ? 'F' : '-') + ($('fine').checked ? 'P' : '-');
       const key = Q.get('nocache') ? null : await fileKey(data.slice(0), optsKey);
+      for (const x of docs.filter(x => x.saved && x !== me && (x.key === key || (x.name === me.name && x.total)))) docs.splice(docs.indexOf(x), 1);
       const doc = await pdfjsLib.getDocument({ data, CMapReaderFactory: EmbeddedCMaps, cMapPacked: true }).promise;
       if (my !== runId) return;
-      pdf = doc; total = doc.numPages; bar.max = total;
+      pdf = doc; total = doc.numPages; bar.max = total; me.pdf = doc; me.total = total;
       if (key) {
         const hit = await cacheGet(key);
         if (my !== runId) return;
         if (hit && hit.total === total) {
           pages = hit.pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => Object.assign({ text: L.t, boxes: L.b || null }, normalize(L.t))) }));
           running = false; bar.value = total; $('stop').classList.add('hidden');
+          me.pages = pages; me.state = 'done'; me.note = '저장된 결과'; me.key = key;
           const when = new Date(hit.at).toLocaleString();
-          setStatus(`저장해 둔 분석 결과를 불러왔습니다 (전체 ${total}쪽, ${when} 분석) · 바로 검색할 수 있습니다`, 'ok');
-          search(); return;
+          setStatus(`${docPrefix(me)}저장해 둔 분석 결과를 불러왔습니다 (전체 ${total}쪽, ${when} 분석) · 바로 검색할 수 있습니다`, 'ok');
+          search(); runNext(); return;
         }
       }
       const lang = 'kor', force = $('force').checked, fine = $('fine').checked;
       await resetPool(lang); analyzedLang = lang;
       let next = 1, done = 0, ocrCount = 0, ocrStart = 0, nnDone = 0, engineNote = '';
-      const t0 = performance.now();
+      const t0 = performance.now(), busy0 = mainBusy;
       // 1단계: 글자 정보가 있으면 그대로, 없으면 빠른 엔진(Tesseract)으로 전체를 훑음 → 바로 검색 가능
       // 2단계: 신경망 엔진(PP-OCRv5)으로 스캔 쪽을 다시 읽어 결과를 보강
       const ocrPages = [], confOf = {};
+      const nWork = Math.min(CFG.workers, total);
+      const nnOn = fine && NN.ok;
+      const pool2 = nnOn ? nnPool(() => my === runId) : null;
+      // 그래픽카드는 CPU 작업자에 더해 하나. 준비돼 있으면 1차 판독 중에도 끝난 쪽부터 바로 읽음
+      if (pool2 && GPU.state !== 'off') pool2.add(gpuStart().then(w => w || Promise.reject(new Error(GPU.why))), true);
+      const ready2 = [];                 // 1차가 끝나 2차를 기다리는 쪽
+      let left1 = nWork, inflight = 0, t1 = 0, k2 = 0, done2 = 0, t2 = 0, wake = null;
+      const poke = () => { if (wake) { const f = wake; wake = null; f(); } };
+      const slotNN = [];
+      NN.cancel = poke;                  // 중지하면 기다리던 2차 작업도 바로 끝냄
+      const toNN = slot => {            // 이 작업자 자리를 Tesseract → 신경망으로 바꿈
+        if (!pool2 || slotNN[slot]) return; slotNN[slot] = true;
+        if (pool[slot]) { pool[slot].then(w => w.terminate()).catch(() => {}); pool[slot] = null; }
+        pool2.add(nnWorker()); poke();
+      };
+      const status2 = () => {
+        let left = '';
+        if (done2 >= 2) left = ' · ' + fmtLeft((performance.now() - t2) / 1000 / done2 * (ocrPages.length - done2));
+        me.p2 = `${done2}/${ocrPages.length}`;
+        setStatus(`${docPrefix(me)}1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
+      };
       const loop1 = async slot => {
         while (my === runId) {
-          const n = next++; if (n > total) return;
+          const n = next++; if (n > total) break;
           const page = await doc.getPage(n);
           let text = '', text2 = '', src = 'text', tboxes = [];
           if (!force) {
@@ -644,12 +556,17 @@
           }
           if (text.replace(/\s/g, '').length < 20) {
             src = 'ocr';
+            if (!ocrCount && CFG.overlap) for (let i = nWork; i < CFG.workers; i++) toNN(i);   // 쪽 수보다 코어가 많으면 남는 코어에서 신경망 엔진을 미리 준비
             if (!ocrStart) { ocrStart = performance.now(); if (!ocrCount) setStatus('글자 인식 엔진 준비 중…'); }
             if (!pool[slot]) pool[slot] = makeWorker(lang);
             const w = await pool[slot];
             if (my !== runId) return;
             const r = await ocrPage(w, page, CFG.dpi1, CFG.psm);
             text = r.text;
+            if (r.lines && r.lines.length && !r.deg) {      // 낱말 위치가 있으면 글줄 단위 글자 + 위치 상자(0~1)
+              text = ''; tboxes = [];
+              for (const L of r.lines) { if (text) text += '\n'; tboxes.push([text.length, text.length + L.t.length, +(L.x0 / r.W).toFixed(4), +(L.y0 / r.H).toFixed(4), +(L.x1 / r.W).toFixed(4), +(L.y1 / r.H).toFixed(4), 0]); text += L.t; }
+            } else tboxes = null;
             if (!r.table && text.replace(/\s/g, '').length < 250 && my === runId) { await setPsm(w, '6'); text2 = (await ocrCanvas(w, r.canvas, r.deg)).text; }
             if (r.canvas) r.canvas.width = r.canvas.height = 0;
             ocrCount++; ocrPages.push(n); confOf[n] = r.conf || 0;
@@ -657,68 +574,313 @@
           }
           page.cleanup();
           if (my !== runId) return;
-          const layers = [Object.assign({ text, boxes: src === 'text' ? tboxes : null }, normalize(text))];
+          const layers = [Object.assign({ text, boxes: tboxes }, normalize(text))];
           if (text2) layers.push(Object.assign({ text: text2 }, normalize(text2)));
           pages[n - 1] = { n, src, layers };
-          done++; bar.value = done;
+          if (src === 'ocr' && pool2 && confOf[n] < CFG.skip2) { ready2.push(n); poke(); }
+          done++; if (!t1) bar.value = done;
           let left = '';
           if (ocrCount >= 2) left = ' · 1차 ' + fmtLeft((performance.now() - ocrStart) / 1000 / ocrCount * (total - done));
-          setStatus(`1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
+          if (!t1) setStatus(`${docPrefix(me)}1차 판독: ${total}쪽 중 ${done}쪽 완료${left}`);
+          searchSoon();
+        }
+        if (my !== runId) return;
+        if (CFG.overlap && ocrCount) toNN(slot);
+        if (--left1 === 0) {            // 1차 판독 끝
+          t1 = Math.max(1, Math.round((performance.now() - t0) / 1000));
+          search();
+          if (pool2 && ocrPages.length) {
+            for (let i = 0; i < CFG.workers; i++) toNN(i);     // 쪽 수가 적어도 글줄을 나눠 모든 코어로 읽음
+            for (const p of pool) if (p) p.then(w => w.terminate()).catch(() => {});
+            pool = []; poolLang = '';
+            if (CFG.skip2 < 100) ocrPages.splice(0, ocrPages.length, ...ocrPages.filter(n => confOf[n] < CFG.skip2));
+            bar.max = ocrPages.length; bar.value = done2;
+            if (done2) status2(); else setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 준비 중…`);
+          }
+          poke();
+        }
+      };
+      // 2차: 1차가 끝난 쪽을 신경망 엔진으로 다시 읽음 (신경망 작업자가 하나라도 생기면 시작)
+      const loop2 = async () => {
+        while (my === runId && NN.ok) {
+          if (!(ready2.length > k2 && pool2.size && inflight < pool2.size + CFG.ahead)) {
+            if (left1 === 0 && ready2.length <= k2) return;
+            await new Promise(f => { const prev = wake; wake = () => { if (prev) prev(); f(); }; });
+            continue;
+          }
+          const n = ready2[k2++]; inflight++;
+          if (!t2) t2 = performance.now();
+          let r = null;
+          try {
+            const page = await doc.getPage(n);
+            r = await nnPage(pool2, page, CFG.dpi);
+            page.cleanup();
+          } catch (e) { if (my !== runId) return; console.error(e); if (!nnDone) { NN.ok = false; engineNote = ' · 신경망 엔진을 쓸 수 없어 1차 판독 결과만 사용'; } }
+          inflight--; poke();
+          if (my !== runId) return;
+          if (r) { nnDone++; const p = pages[n - 1]; p.layers.unshift(Object.assign({ text: r.text, boxes: r.boxes }, normalize(r.text))); }
+          done2++;
+          if (t1) { bar.value = done2; status2(); }
           searchSoon();
         }
       };
-      const nWork = Math.min(CFG.workers, total);
-      await Promise.all(Array.from({ length: nWork }, (_, i) => loop1(i)));
-      if (my !== runId) return;
-      const t1 = Math.round((performance.now() - t0) / 1000);
-      search();
-      if (fine && NN.ok && ocrPages.length) {
-        // 1단계 작업자를 정리해 메모리를 비우고 2단계 시작
-        for (const p of pool) p.then(w => w.terminate()).catch(() => {}); pool = []; poolLang = '';
-        // 1차 판독 신뢰도가 아주 높은 쪽은 2차 판독을 건너뜀 (skip2 기준)
-        if (CFG.skip2 < 100) { const keep = ocrPages.filter(n => confOf[n] < CFG.skip2); ocrPages.length = 0; ocrPages.push(...keep); }
-        ocrPages.sort((a, b) => a - b);
-        setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 준비 중…`);
-        let k = 0, done2 = 0; const t2 = performance.now();
-        bar.value = 0; bar.max = ocrPages.length;
-        const loop2 = async slot => {
-          while (my === runId && NN.ok) {
-            const n = ocrPages[k++]; if (n === undefined) return;
-            let r = null;
-            try {
-              if (!NN.pool[slot]) NN.pool[slot] = nnWorker();
-              const nw = await NN.pool[slot];
-              if (my !== runId) return;
-              const page = await doc.getPage(n);
-              r = await nnPage(nw, page, CFG.dpi);
-              page.cleanup();
-            } catch (e) { console.error(e); if (!nnDone) { NN.ok = false; engineNote = ' · 신경망 엔진을 쓸 수 없어 1차 판독 결과만 사용'; } }
-            if (my !== runId) return;
-            if (r) { nnDone++; const p = pages[n - 1]; p.layers.unshift(Object.assign({ text: r.text, boxes: r.boxes }, normalize(r.text))); }
-            done2++; bar.value = done2;
-            let left = '';
-            if (done2 >= 2) left = ' · ' + fmtLeft((performance.now() - t2) / 1000 / done2 * (ocrPages.length - done2));
-            setStatus(`1차 판독 완료(${t1}초), 검색할 수 있습니다 · 정밀 판독 ${done2}/${ocrPages.length}쪽${left}`);
-            searchSoon();
-          }
-        };
-        await Promise.all(Array.from({ length: Math.min(nWork, ocrPages.length) }, (_, i) => loop2(i)));
-        for (const p of NN.pool) p.then(w => w.terminate()).catch(() => {}); NN.pool = [];
-      }
+      await Promise.all([...Array.from({ length: nWork }, (_, i) => loop1(i)), ...(pool2 ? Array.from({ length: nWork }, loop2) : [])]);
+      if (pool2) pool2.close();
       if (my !== runId) return;
       running = false;
       $('stop').classList.add('hidden');
       const sec = Math.round((performance.now() - t0) / 1000);
-      if (key && !engineNote) cachePut({ key, at: Date.now(), name: file.name, total, pages: pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => ({ t: L.text, b: L.boxes })) })) });
-      setStatus(`분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}`, 'ok');
-      search();
+      if (key && !engineNote) await cachePut({ key, at: Date.now(), name: file.name, total, pages: pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => ({ t: L.text, b: L.boxes })) })) });
+      if (my !== runId) return;
+      setTimeout(prewarm, 1500);        // 다음 파일을 위해 1차 엔진을 미리 준비
+      let gpuNote = '';
+      if (pool2 && pool2.st.gpuN) gpuNote = ` · 그래픽카드가 글줄 ${Math.round(pool2.st.gpuN / (pool2.st.gpuN + pool2.st.cpuN) * 100)}% 판독`;
+      else if (pool2 && ocrCount && Q.get('debug')) gpuNote = ` · 그래픽카드 안 씀(${GPU.state === 'loading' ? '준비가 끝나기 전에 분석이 끝남' : GPU.why || pool2.st.gpuWhy || '쓸 일이 없었음'})`;   // 안 쓴 까닭은 아래 줄에 늘 보임
+      if (key) { me.key = key; refreshSaved(); }
+      me.state = 'done'; me.note = sec + '초';
+      setStatus(`${docPrefix(me)}분석 완료: 전체 ${total}쪽 (OCR ${ocrCount}쪽, 글자 정보 사용 ${total - ocrCount}쪽) · ${sec}초${engineNote}${gpuNote}${Q.get('debug') ? ` · 화면 쪽 작업 ${Math.round((mainBusy - busy0) / 1000)}초` : ''}`, 'ok');
+      search(); runNext();
     } catch (e) {
       if (my !== runId) return;
       runId++; running = false; $('stop').classList.add('hidden');
       console.error(e);
       const msg = e && e.name === 'PasswordException' ? '암호가 걸린 PDF는 열 수 없습니다.'
         : '분석 중 오류가 발생했습니다: ' + (e && e.message ? e.message : e);
-      setStatus(msg, 'err');
+      me.state = 'err'; me.note = msg;
+      setStatus(docPrefix(me) + msg, 'err'); runNext();
+    }
+  }
+  const docPrefix = d => docs.length > 1 ? `[${d.name}] ` : '';
+  function runNext() {        // 대기 중인 다음 파일 분석
+    renderDocs();
+    if (!running && queue.length) setTimeout(() => { if (!running && queue.length) analyze(queue.shift()); }, 0);
+  }
+
+  // ---------- 파일 목록 ----------
+  const listEl = document.createElement('div'); listEl.id = 'docs'; $('drop').insertAdjacentElement('afterend', listEl);
+  const baseTitle = document.title;
+  function renderDocs() {
+    // 브라우저 탭 제목에 진행 상황 (다른 탭에서 일하다가도 보이게)
+    const waiting = queue.length, pct = bar.max ? Math.round(bar.value / bar.max * 100) : 0;
+    document.title = running ? `(${pct}%${waiting ? `, 남은 파일 ${waiting}개` : ''}) ${baseTitle}` : docs.some(d => d.state === 'done') ? `✓ 분석 완료 · ${baseTitle}` : baseTitle;
+    listEl.innerHTML = '';
+    savedBtn();
+    if (!docs.length) return;
+    $('dropTitle').textContent = docs.length === 1 ? docs[0].name : `파일 ${docs.length}개`;
+    $('dropSub').textContent = '파일을 더 넣으려면 다시 누르거나 끌어다 놓으세요 (여러 개 한꺼번에 가능)';
+    const label = { wait: '대기', run: '분석 중', done: '완료', stop: '중지됨', err: '오류', saved: '저장된 결과' };
+    for (const d of docs) {
+      const row = document.createElement('div'); row.className = 'doc';
+      const nm = document.createElement('span'); nm.className = 'doc-name'; nm.textContent = d.name;
+      const st = document.createElement('small');
+      const n = (d.pages || []).filter(Boolean).length;
+      const prog = d.p2 ? `정밀 판독 ${d.p2}쪽` : `1차 판독 ${n}/${d.total}쪽`;
+      st.textContent = (d.state === 'run' && d.total ? prog : label[d.state] + (d.total ? ` · ${d.total}쪽` : '')) + (d.note && d.state !== 'err' ? ` · ${d.note}` : '');
+      if (d.state === 'err') st.className = 'err';
+      row.append(nm, st);
+      if (d.pdf) { const pg = document.createElement('button'); pg.textContent = '쪽 저장'; pg.title = '고른 쪽만 새 PDF로 저장'; pg.onclick = () => openSave(d); row.append(pg); }
+      if (n && d.state === 'done' && d.pdf) { const sp = document.createElement('button'); sp.textContent = '검색되는 PDF'; sp.title = '인식된 글자를 투명하게 넣어, 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있는 PDF로 저장';
+        sp.onclick = async () => { sp.disabled = true; sp.textContent = '만드는 중…'; try { await saveSearchable(d); } catch (e) { console.error(e); alert('저장하지 못했습니다: ' + (e && e.message || e)); } sp.disabled = false; sp.textContent = '검색되는 PDF'; }; row.append(sp); }
+      if (n) { const sv = document.createElement('button'); sv.textContent = '글자 저장'; sv.title = '인식된 글자를 텍스트 파일로 저장'; sv.onclick = () => saveText(d); row.append(sv); }
+      const rm = document.createElement('button'); rm.textContent = '×'; rm.title = '목록에서 빼기'; rm.setAttribute('aria-label', d.name + ' 목록에서 빼기');
+      rm.onclick = () => removeDoc(d); row.append(rm);
+      listEl.appendChild(row);
+    }
+    const withText = docs.filter(x => (x.pages || []).some(Boolean)).length;
+    if (withText >= 2) {
+      const row = document.createElement('div'); row.className = 'doc-all';
+      const sp = document.createElement('span'); sp.className = 'doc-name'; sp.textContent = '';
+      const b = document.createElement('button'); b.textContent = `모든 파일 글자 저장 (${withText}개, ZIP)`; b.onclick = saveAllText;
+      row.append(sp, b); listEl.appendChild(row);
+    }
+  }
+  // 이전에 분석해 이 브라우저에 저장된 결과를 목록에 올려, 원본 PDF 없이도 찾을 수 있게 함
+  let savedCount = 0;
+  const savedEl = document.createElement('div'); savedEl.className = 'doc-all saved-row';
+  listEl.insertAdjacentElement('afterend', savedEl);
+  async function refreshSaved() { savedCount = (await cacheAll()).length; renderDocs(); }
+  function savedBtn() {
+    const shown = new Set(docs.map(d => d.key).filter(Boolean)), n = savedCount - [...shown].length;
+    savedEl.innerHTML = '';
+    if (savedCount && n > 0) {
+      const b = document.createElement('button'); b.textContent = `이전에 분석한 파일 불러오기 (${n}개, 원본 없이 찾기)`;
+      b.title = '이 브라우저에 저장된 분석 결과를 목록에 올립니다. 원본 PDF 없이도 찾을 수 있고, 미리보기는 인식된 글자로 보여 줍니다';
+      b.onclick = loadSaved; savedEl.appendChild(b);
+    }
+  }
+  async function loadSaved() {
+    const recs = (await cacheAll()).sort((a, b) => b.at - a.at);
+    for (const r of recs) {
+      if (docs.some(d => d.key === r.key)) continue;
+      const pages = r.pages.map(p => ({ n: p.n, src: p.src, layers: p.layers.map(L => Object.assign({ text: L.t, boxes: L.b || null }, normalize(L.t))) }));
+      docs.push({ file: null, pdf: null, name: r.name, key: r.key, saved: true, total: r.total, pages, state: 'saved', note: new Date(r.at).toLocaleDateString() + ' 분석 · 원본 없음' });
+    }
+    renderDocs(); search();
+  }
+  function removeDoc(d) {
+    const qi = queue.indexOf(d.file); if (qi >= 0) queue.splice(qi, 1);
+    if (d === curDoc && running) { stopRun(); }
+    if (d.saved) { docs.splice(docs.indexOf(d), 1); renderDocs(); search(); return; }
+    docs.splice(docs.indexOf(d), 1);
+    if (d.pdf && d.pdf !== pdf) d.pdf.destroy().catch(() => {});
+    if (!docs.length) { $('dropTitle').textContent = '여기를 눌러 PDF를 선택하거나, 파일을 끌어다 놓으세요'; $('dropSub').textContent = '스캔본 · 일반 PDF 모두 가능 · 여러 파일 한꺼번에 가능'; curFile = null; setStatus(''); bar.classList.add('hidden'); }
+    renderDocs(); search(); runNext();
+  }
+  // 인식된 글자를 쪽 표시와 함께 텍스트 파일로 (신경망 결과가 있으면 그것, 없으면 1차 결과)
+  const textOf = d => d.pages.filter(Boolean).map(p => `===== ${p.n}쪽 =====\n${p.layers[0].text.trim()}`).join('\n\n');
+  async function saveAllText() {
+    await pdfLibs();
+    const files = {}, enc = new TextEncoder();
+    for (const d of docs.filter(x => (x.pages || []).some(Boolean))) files[d.name.replace(/\.pdf$/i, '') + ' - 인식된 글자.txt'] = enc.encode('\ufeff' + textOf(d));
+    download(new Blob([fflate.zipSync(files, { level: 6 })], { type: 'application/zip' }), `인식된 글자 ${Object.keys(files).length}개 파일.zip`);
+  }
+  function saveText(d) {
+    const body = textOf(d);
+    download(new Blob(['\ufeff' + body], { type: 'text/plain;charset=utf-8' }), d.name.replace(/\.pdf$/i, '') + ' - 인식된 글자.txt');
+  }
+  function download(blob, name) {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name.replace(/[\\/:*?"<>|]/g, '_');
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  }
+
+  // ---------- 고른 쪽을 새 PDF로 저장 ----------
+  // 쪽 적기: "2, 5-7, 10~12" — 쉼표로 나눈 묶음 하나가 '구역'. 구역마다 따로 저장하면 ZIP 하나로 묶어 내려받음
+  let libsP = null;
+  const pdfLibs = () => libsP || (libsP = (async () => { await loadScript('a-pdflib'); await loadScript('a-fflate'); })());
+  function parseRanges(str, total) {
+    const groups = [], bad = [];
+    for (const part of str.split(/[,，;\n]+/).map(x => x.trim()).filter(Boolean)) {
+      const m = part.match(/^(\d+)\s*(?:[-~–]\s*(\d+))?\s*쪽?$/);
+      if (!m) { bad.push(part); continue; }
+      let a = +m[1], b = m[2] ? +m[2] : a; if (a > b) [a, b] = [b, a];
+      if (a < 1 || b > total) { bad.push(part); continue; }
+      const g = []; for (let n = a; n <= b; n++) g.push(n); groups.push(g);
+    }
+    return { groups, bad };
+  }
+  // 쪽 번호들 → "2, 5-7"
+  function compress(ns) {
+    ns = [...new Set(ns)].sort((a, b) => a - b); const out = [];
+    for (let i = 0; i < ns.length; i++) { let j = i; while (j + 1 < ns.length && ns[j + 1] === ns[j] + 1) j++; out.push(i === j ? '' + ns[i] : ns[i] + '-' + ns[j]); i = j; }
+    return out.join(', ');
+  }
+  const hitPages = d => nav.filter(x => x.d === d).map(x => x.n);
+  function openSave(d, pagesText) {
+    const ds = docs.filter(x => x.pdf);
+    if (!ds.length) return;
+    if (!d || !d.pdf) d = ds.find(x => hitPages(x).length) || ds[0];
+    const sel = $('svFile'); sel.innerHTML = '';
+    ds.forEach((x, i) => { const o = document.createElement('option'); o.value = i; o.textContent = `${x.name} (${x.total}쪽)`; if (x === d) o.selected = true; sel.appendChild(o); });
+    const fill = x => { $('svPages').value = compress(hitPages(x)); svCheck(); };
+    sel.onchange = () => fill(ds[+sel.value]);
+    $('svPages').value = pagesText !== undefined ? pagesText : compress(hitPages(d));
+    $('saveDlg').__ds = ds; svCheck(); $('saveDlg').showModal(); $('svPages').focus();
+  }
+  function svCheck() {
+    const dlg = $('saveDlg'), d = dlg.__ds[+$('svFile').value], { groups, bad } = parseRanges($('svPages').value, d.total);
+    const n = new Set(groups.flat()).size, split = $('svSplit').checked;
+    $('svNote').textContent = bad.length ? `알아볼 수 없는 부분: ${bad.join(', ')} (1~${d.total}쪽 사이로 적어 주세요)`
+      : !n ? '저장할 쪽을 적어 주세요. 예: 2, 5-7, 12'
+      : `${n}쪽` + (split && groups.length > 1 ? ` · 구역 ${groups.length}개를 따로 PDF로 만들어 ZIP 하나로 저장` : ' · PDF 한 개로 저장');
+    $('svNote').className = bad.length ? 'err' : '';
+    $('svGo').disabled = !!bad.length || !n;
+  }
+  // ---------- 검색되는 PDF: 스캔 그림은 그대로 두고 인식된 글자를 투명하게 겹쳐 넣음 ----------
+  // (Acrobat 'Searchable Image', OCRmyPDF 와 같은 방식) 어느 PDF 보기 프로그램에서든 Ctrl+F 로 찾고 복사할 수 있음
+  // 글꼴: 모양 없는 글꼴(models/glyphless.ttf, 624바이트) + ToUnicode 로 글자 정보. 한글 글꼴을 넣지 않아 파일이 거의 안 커짐
+  let glyphless = null;
+  async function ocrFont(out) {
+    const P = PDFLib, ctx = out.context;
+    if (!glyphless) glyphless = await asset('a-glyphless', true);
+    const map = new Uint8Array(65536 * 2); for (let i = 0; i < 65536; i++) map[i * 2 + 1] = 1;     // 모든 글자 → 빈 글리프 1
+    const cmap = '/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n' +
+      '/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n1 beginbfrange\n<0000> <FFFF> <0000>\nendbfrange\n' +
+      'endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n';
+    const desc = ctx.obj({ Type: 'FontDescriptor', FontName: 'GlyphLessFont', Flags: 5, FontBBox: [0, 0, 500, 1000], ItalicAngle: 0, Ascent: 1000, Descent: 0, CapHeight: 1000, StemV: 80,
+      FontFile2: ctx.register(ctx.flateStream(glyphless, { Length1: glyphless.length })) });
+    const cid = ctx.obj({ Type: 'Font', Subtype: 'CIDFontType2', BaseFont: 'GlyphLessFont', DW: 500, FontDescriptor: ctx.register(desc),
+      CIDSystemInfo: ctx.obj({ Registry: P.PDFString.of('Adobe'), Ordering: P.PDFString.of('Identity'), Supplement: 0 }), CIDToGIDMap: ctx.register(ctx.flateStream(map)) });
+    return ctx.register(ctx.obj({ Type: 'Font', Subtype: 'Type0', BaseFont: 'GlyphLessFont', Encoding: 'Identity-H', DescendantFonts: [ctx.register(cid)], ToUnicode: ctx.register(ctx.flateStream(cmap)) }));
+  }
+  // 원본 n 쪽의 인식 결과를 outPage 에 투명 글자로 넣음. 넣은 글줄 수를 돌려줌
+  // up: 바로 세운 새 쪽에 넣을 때의 그 쪽 보기(viewport). 없으면 원래 쪽 좌표 그대로
+  async function addTextLayer(outPage, fontRef, d, n, up) {
+    const p = d.pages[n - 1]; if (!p || p.src !== 'ocr') return 0;      // 원래 글자 정보가 있는 쪽은 그대로
+    const P = PDFLib, vp = (await d.pdf.getPage(n)).getViewport({ scale: 1 }), W = vp.width, H = vp.height;
+    const pt = (x, y) => {                                                // 화면(0~1) → PDF 좌표 (쪽 회전·여백 반영)
+      const u = vp.convertToPdfPoint(x * W, y * H); if (!up) return u;
+      const v = up.convertToViewportPoint(u[0], u[1]); return [v[0], up.height - v[1]];
+    };
+    const Ls = p.layers.filter(l => l.boxes && l.boxes.length), lines = [];     // 2차(신경망)와 1차(Tesseract) 결과를 모두 넣어 어느 쪽으로든 찾히게
+    for (const L of Ls) for (const [s, e, x0, y0, x1, y1, rot] of L.boxes) {
+      // 글줄이 놓인 방향: 시작점·끝점(글자 아래쪽)과 위쪽 점
+      const g = rot === 180 ? [[x1, y0], [x0, y0], [x1, y1]] : rot === 90 ? [[x1, y1], [x1, y0], [x0, y1]] : rot === 270 ? [[x0, y0], [x0, y1], [x1, y0]] : [[x0, y1], [x1, y1], [x0, y0]];
+      lines.push([L.text.slice(s, e), ...g]);
+    }
+    if (!Ls.length) {     // 위치 정보가 없는 결과: 찾기·복사는 되도록 왼쪽 위부터 차례로 작게
+      p.layers[0].text.split('\n').filter(t => t.trim()).forEach((t, i) => { const y = 0.02 + i * 0.012; if (y < 0.98) lines.push([t, [0.02, y + 0.01], [0.98, y + 0.01], [0.02, y]]); });
+    }
+    if (!lines.length) return 0;
+    const name = outPage.node.newFontDictionary('OCR', fontRef);
+    const ops = [P.pushGraphicsState(), P.beginText(), P.setTextRenderingMode(P.TextRenderingMode.Invisible)];
+    for (const [text, a, b, c] of lines) {
+      const t = text.replace(/\s+/g, ' ').trim(); if (!t) continue;
+      const A = pt(...a), B = pt(...b), C = pt(...c);
+      const ux = B[0] - A[0], uy = B[1] - A[1], len = Math.hypot(ux, uy), vx = C[0] - A[0], vy = C[1] - A[1], h = Math.hypot(vx, vy);
+      if (len < 1 || h < 1) continue;
+      let hex = ''; for (let i = 0; i < t.length; i++) hex += t.charCodeAt(i).toString(16).padStart(4, '0');
+      ops.push(P.setFontAndSize(name, h), P.setCharacterSqueeze(100 * len / (t.length * 0.5 * h)),
+        P.setTextMatrix(ux / len, uy / len, vx / h, vy / h, A[0], A[1]), P.showText(P.PDFHexString.of(hex)));
+    }
+    ops.push(P.endText(), P.popGraphicsState());
+    outPage.pushOperators(...ops);
+    return lines.length;
+  }
+  // 신경망이 쪽을 돌려 읽었으면 그 각도(모든 글줄이 같을 때만)
+  const pageTurn = (d, n) => { const p = d.pages[n - 1]; if (!p || p.src !== 'ocr') return 0;
+    const r = p.layers.flatMap(L => L.boxes ? L.boxes.map(b => b[6] || 0) : []); return r.length && r.every(x => x === r[0]) ? r[0] : 0; };
+  // src(pdf-lib 원본)의 ns 쪽을 out 에 차례로 넣음. font 가 있으면 투명 글자도.
+  // 눕거나 뒤집힌 쪽은 내용을 바로 세워 새 쪽에 그리고 글자를 가로로 넣음 — 그래야 PDF 보기 프로그램(크롬 등)의 찾기가 됨
+  async function addPages(out, src, d, ns, font) {
+    const P = PDFLib, copied = await out.copyPages(src, ns.map(n => n - 1));
+    for (let i = 0; i < ns.length; i++) {
+      const n = ns[i], turn = font ? pageTurn(d, n) : 0;
+      if (!turn) { out.addPage(copied[i]); if (font) await addTextLayer(copied[i], font, d, n); continue; }
+      const pj = await d.pdf.getPage(n), up = pj.getViewport({ scale: 1, rotation: (pj.rotate + turn) % 360 });
+      const emb = await out.embedPage(src.getPage(n - 1), undefined, [1, 0, 0, 1, 0, 0]);    // 원래 좌표 그대로인 묶음
+      const pg = out.addPage([up.width, up.height]), [a, b, c, e, f, g] = up.transform;     // PDF 좌표 → 바로 세운 보기(아래로 y)
+      const name = pg.node.newXObject('Orig', emb.ref);
+      pg.pushOperators(P.pushGraphicsState(), P.concatTransformationMatrix(a, -b, c, -e, f, up.height - g), P.drawObject(name), P.popGraphicsState());
+      await addTextLayer(pg, font, d, n, up);
+    }
+  }
+  async function saveSearchable(d) {
+    await pdfLibs();
+    const src = await PDFLib.PDFDocument.load(await d.file.arrayBuffer(), { ignoreEncryption: true }), out = await PDFLib.PDFDocument.create();
+    await addPages(out, src, d, Array.from({ length: d.total }, (_, i) => i + 1), await ocrFont(out));
+    download(new Blob([await out.save()], { type: 'application/pdf' }), `${d.name.replace(/\.pdf$/i, '')} (검색 가능).pdf`);
+  }
+  async function savePages() {
+    const dlg = $('saveDlg'), d = dlg.__ds[+$('svFile').value], { groups } = parseRanges($('svPages').value, d.total), split = $('svSplit').checked;
+    const go = $('svGo'); go.disabled = true; go.textContent = '만드는 중…';
+    try {
+      await pdfLibs();
+      const src = await PDFLib.PDFDocument.load(await d.file.arrayBuffer(), { ignoreEncryption: true });
+      const withText = $('svText').checked;
+      const make = async ns => { const out = await PDFLib.PDFDocument.create(); await addPages(out, src, d, ns, withText ? await ocrFont(out) : null); return out.save(); };
+      const base = d.name.replace(/\.pdf$/i, '');
+      if (split && groups.length > 1) {
+        const files = {};
+        for (const g of groups) files[`${base} ${compress(g)}쪽.pdf`] = await make(g);
+        download(new Blob([fflate.zipSync(files, { level: 0 })], { type: 'application/zip' }), `${base} 구역 ${groups.length}개.zip`);
+      } else {
+        const all = groups.flat(), ns = split ? all : [...new Set(all)];
+        download(new Blob([await make(ns)], { type: 'application/pdf' }), `${base} ${compress(ns)}쪽.pdf`);
+      }
+      go.textContent = '저장했습니다'; setTimeout(() => { go.textContent = '저장'; svCheck(); }, 1500);
+    } catch (e) {
+      console.error(e); go.textContent = '저장'; go.disabled = false;
+      $('svNote').textContent = '저장하지 못했습니다: ' + (/encrypt/i.test(e && e.message) ? '암호가 걸린 PDF입니다' : (e && e.message || e)); $('svNote').className = 'err';
     }
   }
 
@@ -758,17 +920,12 @@
     searchTimer = setTimeout(() => { searchTimer = null; search(); }, wait);
   }
 
-  function search() {
-    lastSearch = performance.now();
-    const raw = qEl.value.trim();
-    const q = normalize(raw).out;
-    hitsEl.innerHTML = ''; chipsEl.innerHTML = '';
-    if (!curFile || !q) { summaryEl.textContent = ''; return; }
-    const fuzzyOn = $('fuzzy').checked;
-    const qj = normalize(raw, true).out, k = fuzzyOn ? tolerance(qj.length) : 0;
-    const done = pages.filter(Boolean);
-    const found = [];
-    for (const p of done) {
+  // 한 파일에서 한 낱말을 찾음 → [{ p, L, spans, fuzzy }]
+  function findIn(doc, raw, k) {
+    const q = normalize(raw).out, qj = normalize(raw, true).out, found = [];
+    if (!q) return found;
+    if (k === undefined) k = $('fuzzy').checked ? tolerance(qj.length) : 0;
+    for (const p of doc.pages.filter(Boolean)) {
       let hit = null;
       for (const L of p.layers) {
         const spans = []; let i = L.out.indexOf(q);
@@ -782,43 +939,128 @@
       }
       if (hit) found.push(hit);
     }
-    const partial = !running ? '' : total && done.length === total ? ' (정밀 판독 중이라 결과가 더 나올 수 있습니다)' : ` (지금까지 분석한 ${done.length}/${total || '?'}쪽 기준)`;
-    if (!found.length) {
-      summaryEl.textContent = `"${raw}" 을(를) 찾지 못했습니다${partial}.` +
-        (running ? '' : ' 스캔 상태가 흐리면 인식이 틀릴 수 있으니 더 짧은 단어로도 찾아보세요.');
+    return found;
+  }
+  // 검색: 쉼표(,)로 나누면 여러 낱말을 따로 찾고, 모두 들어 있는 쪽도 보여줌. 파일이 여럿이면 파일별로
+  let nav = [], navI = -1, lastCopy = '', lastRows = [], curTerms = [];
+  function search() {
+    lastSearch = performance.now();
+    if (searchTimer) { clearTimeout(searchTimer); searchTimer = null; }   // 지금 찾으므로 미뤄 둔 검색은 취소
+    renderDocs();
+    const raw = qEl.value.trim();
+    const parsed = raw.split(/(?<!\d)[,，]|[,，](?!\d)/).map(x => {
+      let t = x.trim(), neg = false, exact = false;
+      if (/^[-－](?![\d-])/.test(t)) { neg = true; t = t.slice(1).trim(); }        // -낱말 (단, -33- 같은 숫자는 그대로 찾음)
+      const m = t.match(/^["“”'‘’](.+)["“”'‘’]$/); if (m) { exact = true; t = m[1].trim(); }
+      return { t, neg, exact };
+    }).filter(x => normalize(x.t).out);
+    const pos = parsed.filter(x => !x.neg), negs = parsed.filter(x => x.neg), terms = pos.map(x => x.t);
+    curTerms = terms;
+    $('resTools').classList.add('hidden');
+    hitsEl.innerHTML = ''; chipsEl.innerHTML = ''; nav = []; lastCopy = ''; lastRows = []; $('copyRes').classList.add('hidden'); $('saveRes').classList.add('hidden'); $('csvRes').classList.add('hidden');
+    const ds = docs.filter(d => d.pages && d.pages.some(Boolean));
+    if (!ds.length || !parsed.length) { summaryEl.textContent = ''; return; }
+    if (!terms.length) { summaryEl.textContent = '빼는 말(-낱말)만 있습니다. 찾을 말도 함께 적어 주세요.'; return; }
+    // 결과 보기: 파일 하나만 / 많이 나온 순
+    const fSel = $('fFile'), keep = fSel.value; fSel.innerHTML = '';
+    if (ds.length > 1) { [['', `모든 파일 (${ds.length}개)`]].concat(ds.map((d, i) => [String(i), d.name])).forEach(([v, t]) => { const o = document.createElement('option'); o.value = v; o.textContent = t; fSel.appendChild(o); }); fSel.value = [...fSel.options].some(o => o.value === keep) ? keep : ''; }
+    $('fFileWrap').classList.toggle('hidden', ds.length < 2);
+    const only = ds.length > 1 && fSel.value !== '' ? ds[+fSel.value] : null, byCount = $('fSort').value === 'count';
+    const multiDoc = ds.length > 1, done = ds.reduce((s, d) => s + d.pages.filter(Boolean).length, 0), all = ds.reduce((s, d) => s + d.total, 0);
+    const partial = !running && !queue.length ? '' : done >= all && !queue.length ? ' (정밀 판독 중이라 결과가 더 나올 수 있습니다)' : ` (지금까지 분석한 ${done}쪽 기준)`;
+    // 빼는 말이 (정확히) 있는 쪽
+    const excl = new Map(ds.map(d => [d, new Set(negs.flatMap(x => findIn(d, x.t, 0).map(f => f.p.n)))]));
+    const view = only ? [only] : ds;
+    const res = pos.map(x => {
+      const per = view.map(d => { const found = findIn(d, x.t, x.exact ? 0 : undefined).filter(f => !excl.get(d).has(f.p.n));
+        if (byCount) found.sort((a, b) => (a.fuzzy - b.fuzzy) || (b.spans.length - a.spans.length) || (a.p.n - b.p.n)); return { d, found }; });
+      if (byCount) per.sort((a, b) => b.found.reduce((s, f) => s + f.spans.length, 0) - a.found.reduce((s, f) => s + f.spans.length, 0));
+      return { t: x.t, per };
+    });
+    $('resTools').classList.remove('hidden');
+    const exclNote = negs.length ? ` · "${negs.map(x => x.t).join('", "')}" 이(가) 있는 쪽 ${[...excl.values()].reduce((s, v) => s + v.size, 0)}개 뺌` : '';
+    const copy = [];
+    // 여러 낱말: 모두 들어 있는 쪽
+    if (terms.length > 1) {
+      const both = view.map(d => ({ d, ns: d.pages.filter(Boolean).map(p => p.n).filter(n => res.every(r => r.per.find(x => x.d === d).found.some(f => f.p.n === n))) })).filter(x => x.ns.length);
+      const box = document.createElement('div'); box.className = 'term';
+      const h = document.createElement('div'); h.className = 'term-head';
+      h.textContent = both.length ? `모두 들어 있는 쪽 (${terms.join(' + ')})` : `"${terms.join('", "')}" 이(가) 모두 들어 있는 쪽은 없습니다`;
+      box.appendChild(h);
+      for (const { d, ns } of both) {
+        const line = document.createElement('div'); line.className = 'chips';
+        if (multiDoc) { const fn = document.createElement('span'); fn.className = 'chip-file'; fn.textContent = d.name; line.appendChild(fn); }
+        for (const n of ns) line.appendChild(chipFor(d, n, terms[0], false));
+        box.appendChild(line); copy.push(`[모두] ${multiDoc ? d.name + ': ' : ''}${ns.join(', ')}쪽`);
+      }
+      hitsEl.appendChild(box);
+    }
+    let totPages = 0, totHits = 0, totFz = 0;
+    for (const { t, per } of res) {
+      const box = terms.length > 1 ? document.createElement('div') : null;
+      if (box) { box.className = 'term'; hitsEl.appendChild(box); }
+      const chipsTo = box || chipsEl, hitsTo = box || hitsEl;
+      let np = 0, nh = 0, nf = 0;
+      for (const { found } of per) { np += found.filter(f => !f.fuzzy).length; nh += found.filter(f => !f.fuzzy).reduce((s, f) => s + f.spans.length, 0); nf += found.filter(f => f.fuzzy).length; }
+      totPages += np; totHits += nh; totFz += nf;
+      const parts = [];
+      if (np) parts.push(`${np}개 쪽에서 ${nh}건`);
+      if (nf) parts.push(`비슷한 표현 ${nf}개 쪽`);
+      if (box) { const h = document.createElement('div'); h.className = 'term-head'; h.textContent = `"${t}" — ${parts.join(', ') || '없음'}`; box.appendChild(h); }
+      for (const { d, found } of per) {
+        if (!found.length) continue;
+        const line = document.createElement('div'); line.className = 'chips';
+        if (multiDoc) { const fn = document.createElement('span'); fn.className = 'chip-file'; fn.textContent = d.name; line.appendChild(fn); }
+        for (const f of found) { line.appendChild(chipFor(d, f.p.n, t, f.fuzzy)); }
+        if (box || multiDoc) chipsTo.appendChild(line); else for (const c of [...line.children]) chipsEl.appendChild(c);
+        copy.push(`${terms.length > 1 ? `[${t}] ` : ''}${multiDoc ? d.name + ': ' : ''}${found.map(f => f.p.n + (f.fuzzy ? '?' : '')).join(', ')}쪽`);
+        for (const f of found) {
+          hitsTo.appendChild(hitBlock(d, f, t, multiDoc));
+          const [s0, e0] = f.spans[0], a = Math.max(0, s0 - 40), z = Math.min(f.L.text.length, e0 + 40);
+          lastRows.push([t, d.name, f.p.n, f.fuzzy ? '비슷한 표현' : '정확히', f.spans.length, f.L.text.slice(a, z).replace(/\s+/g, ' ').trim()]);
+        }
+      }
+    }
+    const where = only ? `${only.name} · ` : multiDoc ? `파일 ${ds.length}개 · ` : '';
+    if (!totPages && !totFz) {
+      summaryEl.textContent = `${where}"${terms.join('", "')}" 을(를) 찾지 못했습니다${exclNote}${partial}.` + (running ? '' : ' 스캔 상태가 흐리면 인식이 틀릴 수 있으니 더 짧은 단어로도 찾아보세요.');
       return;
     }
-    const exact = found.filter(f => !f.fuzzy), fz = found.filter(f => f.fuzzy);
-    const parts = [];
-    if (exact.length) parts.push(`${exact.length}개 페이지에서 ${exact.reduce((s, f) => s + f.spans.length, 0)}건 발견`);
-    if (fz.length) parts.push(`비슷한 표현 ${fz.length}개 페이지`);
-    summaryEl.textContent = `"${raw}" — ${parts.join(', ')}${partial}`;
-    for (const { p, L, spans, fuzzy } of found) {
-      const chip = document.createElement('button');
-      chip.className = 'chip' + (fuzzy ? ' fz' : ''); chip.textContent = p.n + '쪽' + (fuzzy ? ' ?' : '');
-      chip.title = fuzzy ? '글자가 조금 다른 비슷한 표현' : '정확히 일치';
-      chip.onclick = () => preview(p.n, raw);
-      chipsEl.appendChild(chip);
-
-      const div = document.createElement('div'); div.className = 'hit';
-      const head = document.createElement('div'); head.className = 'hit-head';
-      const b = document.createElement('button'); b.textContent = p.n + '쪽 보기'; b.onclick = () => preview(p.n, raw);
-      const sm = document.createElement('small');
-      sm.textContent = (fuzzy ? `비슷한 표현 ${spans.length}건 (인식 오류일 수 있음)` : `${spans.length}건`) + (p.src === 'ocr' ? ' · OCR 인식' : '');
-      head.append(b, sm); div.appendChild(head);
-      for (const [s, e] of spans.slice(0, 3)) {
-        const a = Math.max(0, s - 40), z = Math.min(L.text.length, e + 40);
-        const clean = t => esc(t.replace(/\s+/g, ' '));
-        const snip = document.createElement('p'); snip.className = 'snip';
-        snip.innerHTML = (a > 0 ? '… ' : '') + clean(L.text.slice(a, s)) + '<mark>' + clean(L.text.slice(s, e)) + '</mark>' + clean(L.text.slice(e, z)) + (z < L.text.length ? ' …' : '');
-        div.appendChild(snip);
-      }
-      if (spans.length > 3) {
-        const more = document.createElement('p'); more.className = 'snip'; more.textContent = `외 ${spans.length - 3}건`;
-        div.appendChild(more);
-      }
-      hitsEl.appendChild(div);
+    if (terms.length > 1) summaryEl.textContent = `${where}낱말 ${terms.length}개를 따로 찾았습니다${exclNote}${partial}`;
+    else {
+      const parts = [];
+      if (totPages) parts.push(`${totPages}개 페이지에서 ${totHits}건 발견`);
+      if (totFz) parts.push(`비슷한 표현 ${totFz}개 페이지`);
+      summaryEl.textContent = `${where}"${terms[0]}" — ${parts.join(', ')}${exclNote}${partial}`;
     }
+    lastCopy = copy.join('\n'); $('copyRes').classList.remove('hidden'); $('saveRes').classList.remove('hidden'); $('csvRes').classList.remove('hidden');
+  }
+  function chipFor(d, n, t, fuzzy) {
+    const chip = document.createElement('button');
+    chip.className = 'chip' + (fuzzy ? ' fz' : ''); chip.textContent = n + '쪽' + (fuzzy ? ' ?' : '');
+    chip.setAttribute('aria-label', (docs.length > 1 ? d.name + ' ' : '') + n + '쪽' + (fuzzy ? ', 비슷한 표현' : ''));
+    chip.title = (fuzzy ? '글자가 조금 다른 비슷한 표현' : '정확히 일치') + (docs.length > 1 ? ' · ' + d.name : '');
+    const idx = nav.length; nav.push({ d, n, t });
+    chip.onclick = () => preview(d, n, t, idx);
+    return chip;
+  }
+  function hitBlock(d, { p, L, spans, fuzzy }, t, multiDoc) {
+    const div = document.createElement('div'); div.className = 'hit';
+    const head = document.createElement('div'); head.className = 'hit-head';
+    const b = document.createElement('button'); b.textContent = (multiDoc ? d.name.replace(/\.pdf$/i, '') + ' · ' : '') + p.n + '쪽 보기';
+    const idx = nav.findIndex(x => x.d === d && x.n === p.n && x.t === t); b.onclick = () => preview(d, p.n, t, idx);
+    const sm = document.createElement('small');
+    sm.textContent = (fuzzy ? `비슷한 표현 ${spans.length}건 (인식 오류일 수 있음)` : `${spans.length}건`) + (p.src === 'ocr' ? ' · OCR 인식' : '');
+    head.append(b, sm); div.appendChild(head);
+    for (const [s, e] of spans.slice(0, 3)) {
+      const a = Math.max(0, s - 40), z = Math.min(L.text.length, e + 40);
+      const clean = x => esc(x.replace(/\s+/g, ' '));
+      const snip = document.createElement('p'); snip.className = 'snip';
+      snip.innerHTML = (a > 0 ? '… ' : '') + clean(L.text.slice(a, s)) + '<mark>' + clean(L.text.slice(s, e)) + '</mark>' + clean(L.text.slice(e, z)) + (z < L.text.length ? ' …' : '');
+      div.appendChild(snip);
+    }
+    if (spans.length > 3) { const more = document.createElement('p'); more.className = 'snip'; more.textContent = `외 ${spans.length - 3}건`; div.appendChild(more); }
+    return div;
   }
 
   // 쪽 안에서 검색어 위치 찾기: 위치 정보가 있는 판독 결과에서 정확히 → 비슷하게 순서로 찾고, 글줄 상자 안에서 글자 비율로 범위를 좁힘
@@ -850,51 +1092,177 @@
     return [];
   }
 
-  async function preview(n, raw) {
-    if (!pdf) return;
-    $('pvTitle').textContent = `${n}쪽 / 전체 ${total}쪽`;
+  let pvSeq = 0, pvCur = null;
+  // idx: 검색 결과 목록에서의 차례. 'keep' 이면 결과 위치는 그대로 두고 쪽만 넘김
+  async function preview(d, n, raw, idx) {
+    if (n < 1 || n > d.total) return;
+    const my = ++pvSeq, pages = d.pages; if (idx !== 'keep') navI = idx === undefined ? -1 : idx; pvCur = { d, n, raw };
+    $('pvPgPrev').disabled = n <= 1; $('pvPgNext').disabled = n >= d.total;
+    $('pvTitle').textContent = (docs.length > 1 ? d.name + ' · ' : '') + `${n}쪽 / 전체 ${d.total}쪽`;
+    $('pvPrev').disabled = navI <= 0; $('pvNext').disabled = navI < 0 || navI >= nav.length - 1;
+    $('pvPos').textContent = navI >= 0 ? `결과 ${navI + 1}/${nav.length}` : '';
+    const onHit = navI >= 0 && nav[navI] && nav[navI].d === d && nav[navI].n === n;
+    if (navI >= 0 && !onHit) $('pvPos').textContent = `(결과 ${navI + 1}/${nav.length} 근처)`;
     $('pvText').textContent = pages[n - 1] ? pages[n - 1].layers.map(L => L.text).join('\n──────── 2차 판독 ────────\n') : '';
     const dlg = $('dlg'); if (!dlg.open) dlg.showModal();
-    $('pvNote').textContent = '';
-    const page = await pdf.getPage(n);
+    $('pvNote').textContent = ''; $('pvSave').disabled = !d.pdf;
+    const det = $('pvText').closest('details');
+    if (!d.pdf) {           // 이전에 분석한 결과만 있음: 그림 없이 인식된 글자만
+      const pv = $('pv'); pv.width = pv.height = 0; det.open = true;
+      $('pvNote').textContent = '원본 PDF 없이 저장된 결과만 있어 그림은 볼 수 없습니다. 아래 인식된 글자를 보세요. 이 파일을 다시 넣으면 그림과 위치 표시가 나옵니다.';
+      return;
+    }
+    det.open = false;
+    const page = await d.pdf.getPage(n);
     const c = await renderToCanvas(page, 2.2, 2400);
-    const pv = $('pv'); pv.width = c.width; pv.height = c.height;
+    if (my !== pvSeq) { c.width = c.height = 0; return; }      // 그사이 다른 결과로 넘김
+    const pv = $('pv'); pv.width = c.width; pv.height = c.height; applyZoom(); pv.setAttribute('aria-label', `${d.name} ${n}쪽 그림`);
     const ctx = pv.getContext('2d'); ctx.drawImage(c, 0, 0); c.width = c.height = 0;
-    const rs = raw && pages[n - 1] ? locate(pages[n - 1], raw) : [];
-    if (rs.length) {
+    // 찾은 말이 여럿이면 말마다 다른 색 (누른 말을 맨 앞에)
+    const ts = raw ? [raw].concat(curTerms.filter(t => t !== raw)) : [];
+    const COLORS = [['255,214,0', '230,120,0', '노란'], ['80,160,255', '20,90,200', '파란'], ['90,200,120', '20,130,60', '초록'], ['255,120,190', '200,30,120', '분홍'], ['180,140,255', '110,60,200', '보라']];
+    const marks = ts.map((t, i) => ({ t, c: COLORS[i % COLORS.length], rs: pages[n - 1] ? locate(pages[n - 1], t) : [] }));
+    const rs = marks[0] ? marks[0].rs : [];
+    if (marks.some(m => m.rs.length)) {
       const W = pv.width, H = pv.height, pad = 4;
-      ctx.save(); ctx.fillStyle = 'rgba(255, 214, 0, 0.35)'; ctx.strokeStyle = 'rgba(230, 120, 0, 0.95)'; ctx.lineWidth = 3;
-      for (const [x0, y0, x1, y1] of rs) { const x = x0 * W - pad, y = y0 * H - pad, w = (x1 - x0) * W + 2 * pad, h = (y1 - y0) * H + 2 * pad; ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h); }
-      ctx.restore();
-      $('pvNote').textContent = `노란 상자: "${raw}" 위치 ${rs.length}곳 (글자 인식 결과 기준이라 조금 어긋날 수 있습니다)`;
-      const top = Math.min(...rs.map(r => r[1]));
+      for (const m of marks.slice().reverse()) {
+        ctx.save(); ctx.fillStyle = `rgba(${m.c[0]}, 0.35)`; ctx.strokeStyle = `rgba(${m.c[1]}, 0.95)`; ctx.lineWidth = 3;
+        for (const [x0, y0, x1, y1] of m.rs) { const x = x0 * W - pad, y = y0 * H - pad, w = (x1 - x0) * W + 2 * pad, h = (y1 - y0) * H + 2 * pad; ctx.fillRect(x, y, w, h); ctx.strokeRect(x, y, w, h); }
+        ctx.restore();
+      }
+      const shown = marks.filter(m => m.rs.length);
+      $('pvNote').innerHTML = shown.map(m => `<span class="swatch" style="background:rgba(${m.c[0]},.5);border-color:rgb(${m.c[1]})"></span>${m.c[2]} 상자: "${esc(m.t)}" ${m.rs.length}곳`).join(' · ') +
+        ' <span class="muted">(글자 인식 결과 기준이라 조금 어긋날 수 있습니다)</span>';
+      const top = Math.min(...(rs.length ? rs : shown[0].rs).map(r => r[1]));
       requestAnimationFrame(() => { const y = pv.offsetTop + top * pv.clientHeight - dlg.clientHeight / 3; dlg.scrollTop = Math.max(0, y); });
-    } else if (raw) $('pvNote').textContent = '이 쪽에서 정확한 위치는 표시하지 못했습니다. 쪽 전체에서 찾아보세요.';
+    } else if (raw && pages[n - 1] && findIn(d, raw, 0).concat(findIn(d, raw)).some(f => f.p.n === n)) $('pvNote').textContent = '이 쪽에서 정확한 위치는 표시하지 못했습니다. 쪽 전체에서 찾아보세요.';
+    else if (raw) $('pvNote').textContent = `이 쪽에는 "${raw}" 이(가) 없습니다.`;
+    if (!marks.some(m => m.rs.length)) dlg.scrollTop = 0;
   }
+  // 확대: 1 = 창 너비에 맞춤
+  let zoom = 1;
+  function applyZoom() {
+    const pv = $('pv');
+    if (zoom === 1) { pv.style.maxWidth = '100%'; pv.style.width = ''; } else { pv.style.maxWidth = 'none'; pv.style.width = (zoom * 100) + '%'; }
+    $('pvZoom').textContent = zoom === 1 ? '맞춤' : Math.round(zoom * 100) + '%';
+  }
+  const setZoom = z => { zoom = Math.max(1, Math.min(3, Math.round(z * 4) / 4)); applyZoom(); };
 
   window.__pages = () => pages.map(p => p ? p.layers.map(L => L.text).join('\n=== 2차 ===\n') : '');   // 점검용
-  function pick(file) {
-    if (!file) return;
-    if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') { setStatus('PDF 파일만 사용할 수 있습니다.', 'err'); return; }
-    analyze(file);
+  function pick(files) {
+    files = [...(files || [])].filter(Boolean);
+    const ok = files.filter(f => /\.pdf$/i.test(f.name) || f.type === 'application/pdf');
+    if (!ok.length) { if (files.length) setStatus('PDF 파일만 사용할 수 있습니다.', 'err'); return; }
+    for (const f of ok) {
+      if (docs.some(d => d.file && d.name === f.name && d.file.size === f.size && d.state !== 'err')) continue;   // 이미 목록에 있는 파일
+      docs.push({ file: f, name: f.name, pages: [], total: 0, state: 'wait', note: '' }); queue.push(f);
+    }
+    renderDocs(); runNext();
+  }
+
+  // ---------- 그래픽카드 ----------
+  // 페이지를 열면 바로 준비하고 속도를 재어 둠. 한 번 준비되면 다음 파일에도 계속 씀
+  function gpuShow() {
+    gpuEl.textContent = `이 컴퓨터: 코어 ${cores}개, 동시 작업 ${CFG.workers}개 · 그래픽카드: ` + ({ idle: '확인 전', loading: '준비 중… (처음 한 번 수십 초 걸릴 수 있음)',
+      ready: `사용함 — ${GPU.name || '이름 모름'}, 글줄 읽기가 CPU 한 코어보다 약 ${GPU.speed}배 빠름`, off: `안 씀 — ${GPU.why}` })[GPU.state];
+  }
+  function gpuStart() {
+    if (GPU.p) return GPU.p;
+    if (GPU.state === 'off' || !NN.ok) return Promise.resolve(null);
+    GPU.state = 'loading'; gpuShow(); let late = false;
+    const wp = nnWorker('webgpu');
+    const timeout = new Promise((_, no) => setTimeout(() => { late = true; no(new Error('준비 시간 초과(2분)')); }, 120000));
+    wp.then(w => { if (late) w.terminate(); }, () => {});
+    GPU.p = Promise.race([wp, timeout]).then(w => {
+      const x = 0.26 / w.msPerCol;      // 0.26: 4코어 시험 컴퓨터에서 CPU 한 코어의 글줄 너비 1픽셀당 시간(ms)
+      if (CFG.gpu !== 'force' && x < 1.25) { w.terminate(); throw new Error(`CPU 한 코어보다 빠르지 않음(${x.toFixed(1)}배${w.name ? ', ' + w.name : ''})`); }
+      w.keep = true; GPU.w = w; GPU.name = w.name; GPU.speed = x >= 10 ? Math.round(x) : x.toFixed(1); GPU.state = 'ready'; gpuShow(); return w;
+    }).catch(e => { GPU.state = 'off'; GPU.why = String(e && e.message || e); gpuShow(); return null; });
+    return GPU.p;
+  }
+
+  // 파일을 고르기 전에 엔진을 미리 준비해 두어 분석 시작이 빨라지게 함
+  function prewarm() {
+    if (running || pool.some(Boolean) || !CFG.warm) return;
+    poolLang = 'kor';
+    pool = Array.from({ length: CFG.workers }, (_, i) => { const p = makeWorker('kor'); p.catch(() => { if (pool[i] === p) pool[i] = null; }); return p; });
+    if (NN.ok) nnRes().catch(() => {});
+    if (NN.ok && CFG.warm && $('fine').checked) gpuStart();
   }
 
   drop.onclick = () => fileInput.click();
   drop.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fileInput.click(); } };
-  fileInput.onchange = () => { pick(fileInput.files[0]); fileInput.value = ''; };
+  fileInput.onchange = () => { pick(fileInput.files); fileInput.value = ''; };
   ['dragenter', 'dragover'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
   ['dragleave', 'drop'].forEach(ev => document.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
-  document.addEventListener('drop', e => pick(e.dataTransfer.files[0]));
-  $('stop').onclick = () => {
-    runId++; running = false; $('stop').classList.add('hidden');
-    setStatus(`중지됨: ${pages.filter(Boolean).length}/${total}쪽까지 분석했습니다.`); search();
+  document.addEventListener('drop', e => pick(e.dataTransfer.files));
+  function stopRun() {
+    runId++; if (NN.cancel) NN.cancel(); running = false; $('stop').classList.add('hidden');
+    if (curDoc) { curDoc.state = 'stop'; curDoc.note = `${pages.filter(Boolean).length}/${total}쪽까지`; }
+  }
+  $('stop').onclick = () => {      // 지금 파일과 대기 중인 파일 모두 멈춤
+    stopRun();
+    for (const f of queue.splice(0)) { const d = docs.find(x => x.file === f); if (d) { d.state = 'stop'; d.note = '시작 전'; } }
+    setStatus(`중지됨: ${pages.filter(Boolean).length}/${total}쪽까지 분석했습니다.`); renderDocs(); search();
   };
-  $('force').onchange = $('fine').onchange = () => { if (curFile) analyze(curFile); };
-  $('clearCache').onclick = async () => { await cacheClear(); $('clearCache').textContent = '저장된 결과를 지웠습니다'; };
-  $('go').onclick = search;
+  $('force').onchange = $('fine').onchange = () => {    // 설정이 바뀌면 목록의 파일을 모두 다시 분석
+    if (!docs.length) return;
+    if (running) stopRun();
+    queue.splice(0); for (const d of docs.filter(x => x.file)) { d.state = 'wait'; d.note = ''; queue.push(d.file); }
+    renderDocs(); runNext();
+  };
+  $('clearCache').onclick = async () => { await cacheClear(); $('clearCache').textContent = '저장된 결과를 지웠습니다'; for (const d of docs.filter(x => x.saved)) docs.splice(docs.indexOf(d), 1); refreshSaved(); search(); };
+  refreshSaved();
+  $('go').onclick = () => { search(); remember(); };
+  // 설정과 최근 검색어를 이 브라우저에 기억(없거나 막혀 있으면 그냥 넘어감)
+  const store = { get: k => { try { return JSON.parse(localStorage.getItem('ppf.' + k)); } catch (e) { return null; } }, set: (k, v) => { try { localStorage.setItem('ppf.' + k, JSON.stringify(v)); } catch (e) {} } };
+  for (const id of ['fine', 'fuzzy', 'force']) { const v = store.get(id); if (typeof v === 'boolean') $(id).checked = v; $(id).addEventListener('change', () => store.set(id, $(id).checked)); }
+  const dl = document.createElement('datalist'); dl.id = 'recentQ'; document.body.appendChild(dl); qEl.setAttribute('list', 'recentQ');
+  const showRecent = () => { dl.innerHTML = ''; for (const r of store.get('recent') || []) { const o = document.createElement('option'); o.value = r; dl.appendChild(o); } };
+  function remember() {
+    const v = qEl.value.trim(); if (!v || !summaryEl.textContent || /찾지 못했습니다/.test(summaryEl.textContent)) return;
+    store.set('recent', [v].concat((store.get('recent') || []).filter(x => x !== v)).slice(0, 10)); showRecent();
+  }
+  showRecent();
   $('fuzzy').onchange = search;
+  $('fFile').onchange = $('fSort').onchange = search;
   let typing = null;
   qEl.oninput = () => { clearTimeout(typing); typing = setTimeout(search, 150); };
-  qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); } };
+  qEl.onkeydown = e => { if (e.key === 'Enter') { clearTimeout(typing); search(); remember(); } };
+  qEl.addEventListener('change', remember);
+  // '/' 를 누르면 검색창으로
+  document.addEventListener('keydown', e => { if (e.key === '/' && document.activeElement === document.body && !$('dlg').open && !$('saveDlg').open) { e.preventDefault(); qEl.focus(); qEl.select(); } });
   $('pvClose').onclick = () => $('dlg').close();
+  const go = k => { const x = nav[navI + k]; if (x) preview(x.d, x.n, x.t, navI + k); };
+  $('pvPrev').onclick = () => go(-1); $('pvNext').onclick = () => go(1);
+  $('pvSave').onclick = () => { if (pvCur) { $('dlg').close(); openSave(pvCur.d, String(pvCur.n)); } };
+  $('saveRes').onclick = () => openSave(null);
+  // 엑셀에서 바로 열리는 CSV (한글이 깨지지 않게 BOM)
+  $('csvRes').onclick = () => {
+    const cell = v => { v = String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    const rows = [['찾은 말', '파일', '쪽', '일치', '건수', '찾은 부분']].concat(lastRows);
+    const q = qEl.value.trim().replace(/[\\/:*?"<>|]/g, '').slice(0, 30);
+    download(new Blob(['\ufeff' + rows.map(r => r.map(cell).join(',')).join('\r\n')], { type: 'text/csv;charset=utf-8' }), `찾기 결과 - ${q}.csv`);
+  };
+  $('svPages').oninput = svCheck; $('svFile').onchange = svCheck; $('svSplit').onchange = $('svOne').onchange = svCheck;
+  $('svGo').onclick = savePages; $('svClose').onclick = () => $('saveDlg').close();
+  $('svPages').onkeydown = e => { if (e.key === 'Enter' && !$('svGo').disabled) savePages(); };
+  const page = k => { if (pvCur) preview(pvCur.d, pvCur.n + k, pvCur.raw, 'keep'); };
+  $('pvPgPrev').onclick = () => page(-1); $('pvPgNext').onclick = () => page(1);
+  $('pvZoomIn').onclick = () => setZoom(zoom + 0.5); $('pvZoomOut').onclick = () => setZoom(zoom - 0.5); $('pvZoom').onclick = () => setZoom(1);
+  // ←/→ 결과, PageUp/PageDown 쪽, +/− 확대, 0 맞춤
+  // 버튼이 비활성화되면 초점이 창 밖으로 빠지므로, 미리보기 창이 열려 있으면 어디서 누르든 받음
+  document.addEventListener('keydown', e => {
+    if (!$('dlg').open || /INPUT|SELECT|TEXTAREA/.test((document.activeElement || {}).tagName)) return;
+    const k = { ArrowLeft: () => go(-1), ArrowRight: () => go(1), PageUp: () => page(-1), PageDown: () => page(1), '+': () => setZoom(zoom + 0.5), '=': () => setZoom(zoom + 0.5), '-': () => setZoom(zoom - 0.5), '0': () => setZoom(1) }[e.key];
+    if (k && !e.ctrlKey && !e.metaKey && !e.altKey) { e.preventDefault(); k(); }
+  });
+  $('copyRes').onclick = async () => {
+    try { await navigator.clipboard.writeText(lastCopy); }
+    catch (e) { const t = document.createElement('textarea'); t.value = lastCopy; document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove(); }
+    $('copyRes').textContent = '복사했습니다'; setTimeout(() => { $('copyRes').textContent = '결과 복사'; }, 1500);
+  };
+  if (early) { pick(early); early = null; }
+  gpuShow();
+  setTimeout(prewarm, 0);              // 화면 동작을 다 연결한 뒤에 준비 시작
 })();
